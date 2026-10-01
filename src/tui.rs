@@ -1,9 +1,10 @@
-//! The dashboard: `vx` with no arguments. A table of VMs whose state refreshes every second,
-//! with keys for everything the CLI does.
+//! The dashboard: `vx` with no arguments. Two views in one box, switched with Tab: a table of VMs
+//! whose state refreshes every second, and a table of images.
 //!
 //! Actions run the CLI itself as a child process, so they share its locks, checks and messages:
-//! quick ones (start, stop, pause, delete) in the background with their output captured, and
-//! interactive ones (ssh, console, logs, new) in the foreground with the dashboard set aside.
+//! most in the background with their output captured, and the interactive ones (ssh, console,
+//! logs) in the foreground with the dashboard set aside until they end. Creating a VM and adding
+//! an image use forms drawn in the dashboard.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -27,7 +28,12 @@ use ratatui::widgets::{
 };
 use ratatui::{DefaultTerminal, Frame};
 
+use crate::NewArgs;
 use crate::backend::{self, State};
+use crate::form::{AddImageForm, NewForm, NewImage, Step};
+use crate::host::Arch;
+use crate::image::{self, Info};
+use crate::progress::bytes;
 use crate::style::{self, ERR, OUT};
 use crate::vx::{Home, Spec};
 
@@ -75,9 +81,9 @@ pub fn entries(home: &Home) -> Result<Vec<Entry>> {
 
 /// What the other threads tell the dashboard.
 enum Msg {
-    Vms(Result<Vec<Entry>, String>),
-    /// A background action finished.
-    Done { name: String, verb: Verb, result: Result<(), String> },
+    Snapshot { vms: Result<Vec<Entry>, String>, images: Vec<Info> },
+    /// A background job finished.
+    Done { target: Target, verb: Verb, result: Result<(), String> },
 }
 
 /// Everything the main loop needs besides the app state.
@@ -91,11 +97,12 @@ struct Io {
 }
 
 pub fn run(home: &Home) -> Result<()> {
+    let host = Arch::host()?;
     ignore_sigint();
     let (tx, rx) = mpsc::channel();
-    let wake = refresher(home, tx.clone());
+    let wake = refresher(home, host, tx.clone());
     let io = Io { rx, tx, wake, exe: env::current_exe()?, home: home.root().to_path_buf() };
-    ratatui::run(|terminal| App::default().run(terminal, &io))
+    ratatui::run(|terminal| App::new(home, host).run(terminal, &io))
 }
 
 /// Ctrl-C in an ssh session or `vx logs -f` should end that, not the dashboard. A no-op handler
@@ -106,13 +113,14 @@ fn ignore_sigint() {
     unsafe { libc::signal(libc::SIGINT, ignore as extern "C" fn(libc::c_int) as libc::sighandler_t) };
 }
 
-/// Reload the VM list on a thread, so a slow VM never freezes the screen.
-fn refresher(home: &Home, tx: Sender<Msg>) -> Sender<()> {
+/// Reload VMs and images on a thread, so a slow VM never freezes the screen.
+fn refresher(home: &Home, host: Arch, tx: Sender<Msg>) -> Sender<()> {
     let (wake, woken) = mpsc::channel();
     let home = Home::at(home.root());
     thread::spawn(move || {
         loop {
-            if tx.send(Msg::Vms(entries(&home).map_err(|e| format!("{e:#}")))).is_err() {
+            let vms = entries(&home).map_err(|e| format!("{e:#}"));
+            if tx.send(Msg::Snapshot { vms, images: image::infos(&home, host) }).is_err() {
                 return; // the dashboard closed
             }
             if let Err(RecvTimeoutError::Disconnected) = woken.recv_timeout(REFRESH) {
@@ -123,7 +131,21 @@ fn refresher(home: &Home, tx: Sender<Msg>) -> Sender<()> {
     wake
 }
 
-/// Background actions, run as `vx <verb> <name>`.
+/// What a background job is about.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Target {
+    Vm(String),
+    Image(String),
+}
+
+impl Target {
+    fn name(&self) -> &str {
+        match self {
+            Target::Vm(name) | Target::Image(name) => name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verb {
     Start,
@@ -132,10 +154,15 @@ enum Verb {
     Pause,
     Resume,
     Delete,
+    Create,
+    Pull,
+    RemoveImage,
+    AddImage,
 }
 
 impl Verb {
-    fn args(self) -> &'static [&'static str] {
+    /// The `vx` arguments for a VM job; the name goes last.
+    fn vm_args(self) -> &'static [&'static str] {
         match self {
             Verb::Start => &["start"],
             Verb::Stop => &["stop"],
@@ -143,17 +170,21 @@ impl Verb {
             Verb::Pause => &["pause"],
             Verb::Resume => &["resume"],
             Verb::Delete => &["rm", "-y"],
+            _ => &[],
         }
     }
 
-    /// Shown in the STATE column while it runs.
+    /// Shown in place of the state while it runs.
     fn doing(self) -> &'static str {
         match self {
             Verb::Start => "starting",
             Verb::Stop | Verb::ForceStop => "stopping",
             Verb::Pause => "pausing",
             Verb::Resume => "resuming",
-            Verb::Delete => "deleting",
+            Verb::Delete | Verb::RemoveImage => "deleting",
+            Verb::Create => "creating",
+            Verb::Pull => "downloading",
+            Verb::AddImage => "copying",
         }
     }
 
@@ -163,7 +194,10 @@ impl Verb {
             Verb::Stop | Verb::ForceStop => "stopped",
             Verb::Pause => "paused",
             Verb::Resume => "resumed",
-            Verb::Delete => "deleted",
+            Verb::Delete | Verb::RemoveImage => "deleted",
+            Verb::Create => "is ready",
+            Verb::Pull => "downloaded",
+            Verb::AddImage => "added",
         }
     }
 }
@@ -175,18 +209,28 @@ impl fmt::Display for Verb {
             Verb::Stop | Verb::ForceStop => "stop",
             Verb::Pause => "pause",
             Verb::Resume => "resume",
-            Verb::Delete => "delete",
+            Verb::Delete | Verb::RemoveImage => "delete",
+            Verb::Create => "create",
+            Verb::Pull => "download",
+            Verb::AddImage => "add",
         })
     }
 }
 
-/// Interactive actions, which take over the terminal until they end.
+/// A background `vx` run.
+#[derive(Debug, PartialEq, Eq)]
+struct Job {
+    target: Target,
+    verb: Verb,
+    args: Vec<String>,
+}
+
+/// Interactive commands, which take over the terminal until they end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Foreground {
     Ssh(String),
     Console(String),
     Logs(String),
-    New,
 }
 
 impl Foreground {
@@ -195,7 +239,6 @@ impl Foreground {
             Foreground::Ssh(name) => &["ssh", name],
             Foreground::Console(name) => &["console", name],
             Foreground::Logs(name) => &["logs", "-f", name],
-            Foreground::New => &["new"],
         };
         args.iter().map(|s| s.to_string()).collect()
     }
@@ -212,21 +255,40 @@ impl Foreground {
 enum Action {
     None,
     Quit,
-    Job(String, Verb),
+    Job(Job),
     Run(Foreground),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum View {
+    #[default]
+    Vms,
+    Images,
+}
+
 enum Modal {
     Help,
     /// Asking before deleting this VM.
-    Delete(String),
+    DeleteVm(String),
+    /// Asking before deleting this image's local copy.
+    DeleteImage { name: String, size: u64, custom: bool },
+    New(Box<NewForm>),
+    AddImage(Box<AddImageForm>),
+}
+
+/// A VM being created, shown as a row before its directory exists.
+struct Pending {
+    image: String,
+    arch: Arch,
+    cpus: String,
+    memory: String,
 }
 
 struct Busy {
     verb: Verb,
     /// Finished; cleared once a refresh shows the outcome, so the old state never flashes back.
     done: bool,
+    pending: Option<Pending>,
 }
 
 struct Status {
@@ -235,21 +297,45 @@ struct Status {
     at: Instant,
 }
 
-#[derive(Default)]
 struct App {
+    home: Home,
+    host: Arch,
+    view: View,
     /// `None` until the first refresh arrives.
     vms: Option<Vec<Entry>>,
+    images: Vec<Info>,
     /// Why the last refresh failed, e.g. VX_HOME isn't readable.
     error: Option<String>,
     table: TableState,
-    busy: HashMap<String, Busy>,
+    image_table: TableState,
+    busy: HashMap<Target, Busy>,
     status: Option<Status>,
     modal: Option<Modal>,
+    /// Select this VM as soon as it shows up, e.g. one just created.
+    follow: Option<String>,
     /// Advances every tick, for the spinners.
     tick: usize,
 }
 
 impl App {
+    fn new(home: &Home, host: Arch) -> App {
+        App {
+            home: Home::at(home.root()),
+            host,
+            view: View::Vms,
+            vms: None,
+            images: Vec::new(),
+            error: None,
+            table: TableState::default(),
+            image_table: TableState::default(),
+            busy: HashMap::new(),
+            status: None,
+            modal: None,
+            follow: None,
+            tick: 0,
+        }
+    }
+
     fn run(mut self, terminal: &mut DefaultTerminal, io: &Io) -> Result<()> {
         loop {
             while let Ok(msg) = io.rx.try_recv() {
@@ -273,7 +359,7 @@ impl App {
             match self.key(key) {
                 Action::None => {}
                 Action::Quit => return Ok(()),
-                Action::Job(name, verb) => spawn_job(io, name, verb),
+                Action::Job(job) => spawn_job(io, job),
                 Action::Run(fg) => {
                     suspend(terminal, || run_foreground(io, &fg))?;
                     let _ = io.wake.send(());
@@ -284,14 +370,21 @@ impl App {
 
     fn handle(&mut self, msg: Msg, io: &Io) {
         match msg {
-            Msg::Vms(Ok(vms)) => self.update(vms),
-            Msg::Vms(Err(e)) => self.error = Some(e),
-            Msg::Done { name, verb, result } => {
+            Msg::Snapshot { vms: Ok(vms), images } => {
+                self.update(vms);
+                self.update_images(images);
+            }
+            Msg::Snapshot { vms: Err(e), images } => {
+                self.error = Some(e);
+                self.update_images(images);
+            }
+            Msg::Done { target, verb, result } => {
+                let name = target.name();
                 match result {
                     Ok(()) => self.say(format!("✓ {name} {}", verb.done()), OK),
                     Err(e) => self.say(format!("✗ couldn't {verb} {name}: {e}"), ERROR),
                 }
-                if let Some(busy) = self.busy.get_mut(&name) {
+                if let Some(busy) = self.busy.get_mut(&target) {
                     busy.done = true;
                 }
                 let _ = io.wake.send(());
@@ -301,22 +394,31 @@ impl App {
 
     /// Take a fresh list, keeping the same VM selected even if others came or went.
     fn update(&mut self, vms: Vec<Entry>) {
-        let selected = self.selected().map(|e| e.name.clone());
-        let index = selected.and_then(|name| vms.iter().position(|e| e.name == name));
-        let index = match (index, self.table.selected()) {
-            (Some(i), _) => Some(i),
-            (None, _) if vms.is_empty() => None,
-            (None, Some(i)) => Some(i.min(vms.len() - 1)),
-            (None, None) => Some(0),
-        };
-        self.table.select(index);
+        let wanted = self.follow.clone().filter(|name| vms.iter().any(|e| &e.name == name));
+        if wanted.is_some() {
+            self.follow = None;
+        }
+        let wanted = wanted.or_else(|| self.selected().map(|e| e.name.clone()));
+        let index = wanted.and_then(|name| vms.iter().position(|e| e.name == name));
+        self.table.select(keep_in_range(index, self.table.selected(), vms.len()));
         self.busy.retain(|_, busy| !busy.done);
         self.vms = Some(vms);
         self.error = None;
     }
 
+    fn update_images(&mut self, images: Vec<Info>) {
+        let wanted = self.selected_image().map(|i| i.name.clone());
+        let index = wanted.and_then(|name| images.iter().position(|i| i.name == name));
+        self.image_table.select(keep_in_range(index, self.image_table.selected(), images.len()));
+        self.images = images;
+    }
+
     fn selected(&self) -> Option<&Entry> {
         self.vms.as_ref()?.get(self.table.selected()?)
+    }
+
+    fn selected_image(&self) -> Option<&Info> {
+        self.images.get(self.image_table.selected()?)
     }
 
     fn say(&mut self, text: String, style: Style) {
@@ -329,10 +431,10 @@ impl App {
         let name = entry.name.clone();
         let found = match &entry.vm {
             Err(e) => Err(format!("✗ {name}: {e}")),
-            Ok(_) if self.busy.contains_key(&name) => {
-                Err(format!("{name} is busy {}", self.busy[&name].verb.doing()))
-            }
-            Ok((_, state)) => Ok(state.clone()),
+            Ok(_) => match self.busy.get(&Target::Vm(name.clone())) {
+                Some(busy) => Err(format!("{name} is busy {}", busy.verb.doing())),
+                None => Ok(entry.vm.as_ref().map(|(_, state)| state.clone()).unwrap_or(State::Stopped)),
+            },
         };
         match found {
             Ok(state) => Some((name, state)),
@@ -343,42 +445,121 @@ impl App {
         }
     }
 
-    fn job(&mut self, name: String, verb: Verb) -> Action {
-        self.busy.insert(name.clone(), Busy { verb, done: false });
-        Action::Job(name, verb)
+    fn job(&mut self, target: Target, verb: Verb, args: Vec<String>) -> Action {
+        self.busy.insert(target.clone(), Busy { verb, done: false, pending: None });
+        Action::Job(Job { target, verb, args })
+    }
+
+    fn vm_job(&mut self, name: String, verb: Verb) -> Action {
+        let mut args: Vec<String> = verb.vm_args().iter().map(|s| s.to_string()).collect();
+        args.push(name.clone());
+        self.job(Target::Vm(name), verb, args)
+    }
+
+    /// Start `vx new` in the background; the VM shows as a row right away.
+    fn create(&mut self, args: NewArgs) -> Action {
+        let name = args.name.clone().unwrap_or_default();
+        let pending = Pending {
+            image: args.image.clone(),
+            arch: args.arch.unwrap_or(self.host),
+            cpus: args.cpus.map(|c| c.to_string()).unwrap_or_default(),
+            memory: args.mem.clone().unwrap_or_default(),
+        };
+        self.busy.insert(Target::Vm(name.clone()), Busy { verb: Verb::Create, done: false, pending: Some(pending) });
+        self.view = View::Vms;
+        self.follow = Some(name.clone());
+        Action::Job(Job { target: Target::Vm(name), verb: Verb::Create, args: new_argv(&args) })
+    }
+
+    fn open_new(&mut self, image: Option<String>) {
+        let args = NewArgs {
+            name: None,
+            interactive: true,
+            image: image.unwrap_or_else(|| image::DEFAULT.into()),
+            cpus: None,
+            mem: None,
+            disk: "20G".into(),
+            arch: None,
+            no_start: false,
+        };
+        match NewForm::new(&self.home, args) {
+            Ok(form) => self.modal = Some(Modal::New(Box::new(form))),
+            Err(e) => self.say(format!("✗ {e:#}"), ERROR),
+        }
     }
 
     fn key(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
         }
-        match self.modal.take() {
-            // Any key closes the help.
-            Some(Modal::Help) => return Action::None,
-            Some(Modal::Delete(name)) => {
-                return match key.code {
-                    KeyCode::Char('y' | 'Y') => self.job(name, Verb::Delete),
-                    KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => Action::None,
-                    _ => {
-                        self.modal = Some(Modal::Delete(name));
-                        Action::None
-                    }
-                };
-            }
-            None => {}
+        if let Some(modal) = self.modal.take() {
+            return self.modal_key(modal, key);
         }
-
-        let len = self.vms.as_ref().map_or(0, Vec::len);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
-            KeyCode::Char('n') => return Action::Run(Foreground::New),
-            KeyCode::Up | KeyCode::Char('k') => self.table.select_previous(),
-            KeyCode::Down | KeyCode::Char('j') if len > 0 => {
-                self.table.select(Some(self.table.selected().map_or(0, |i| (i + 1).min(len - 1))));
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.view = match self.view {
+                    View::Vms => View::Images,
+                    View::Images => View::Vms,
+                }
             }
-            KeyCode::Home | KeyCode::Char('g') if len > 0 => self.table.select_first(),
-            KeyCode::End | KeyCode::Char('G') if len > 0 => self.table.select(Some(len - 1)),
+            _ => {
+                return match self.view {
+                    View::Vms => self.vm_key(key),
+                    View::Images => self.image_key(key),
+                };
+            }
+        }
+        Action::None
+    }
+
+    fn modal_key(&mut self, modal: Modal, key: KeyEvent) -> Action {
+        let confirm = |key: KeyEvent| match key.code {
+            KeyCode::Char('y' | 'Y') => Some(true),
+            KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => Some(false),
+            _ => None,
+        };
+        match modal {
+            // Any key closes the help.
+            Modal::Help => {}
+            Modal::DeleteVm(name) => match confirm(key) {
+                Some(true) => return self.vm_job(name, Verb::Delete),
+                Some(false) => {}
+                None => self.modal = Some(Modal::DeleteVm(name)),
+            },
+            Modal::DeleteImage { name, size, custom } => match confirm(key) {
+                Some(true) => {
+                    let args = vec!["images".into(), "rm".into(), name.clone()];
+                    return self.job(Target::Image(name), Verb::RemoveImage, args);
+                }
+                Some(false) => {}
+                None => self.modal = Some(Modal::DeleteImage { name, size, custom }),
+            },
+            Modal::New(mut form) => match form.handle(key) {
+                Step::Done(args) => return self.create(args),
+                Step::Cancel => {}
+                Step::Continue => self.modal = Some(Modal::New(form)),
+            },
+            Modal::AddImage(mut form) => match form.handle(key) {
+                Step::Done(NewImage { name, file }) => {
+                    let args = vec!["images".into(), "add".into(), name.clone(), file];
+                    return self.job(Target::Image(name), Verb::AddImage, args);
+                }
+                Step::Cancel => {}
+                Step::Continue => self.modal = Some(Modal::AddImage(form)),
+            },
+        }
+        Action::None
+    }
+
+    fn vm_key(&mut self, key: KeyEvent) -> Action {
+        let len = self.vms.as_ref().map_or(0, Vec::len);
+        if navigate(&mut self.table, key.code, len) {
+            return Action::None;
+        }
+        match key.code {
+            KeyCode::Char('n') => self.open_new(None),
             KeyCode::Enter => {
                 if let Some((name, _)) = self.target() {
                     return Action::Run(Foreground::Ssh(name));
@@ -395,27 +576,68 @@ impl App {
                 None => {}
             },
             KeyCode::Char('s') => match self.target() {
-                Some((name, State::Stopped)) => return self.job(name, Verb::Start),
+                Some((name, State::Stopped)) => return self.vm_job(name, Verb::Start),
                 Some((name, state)) => self.say(format!("{name} is already {state}"), DIM),
                 None => {}
             },
             KeyCode::Char(c @ ('x' | 'X')) => match self.target() {
                 Some((name, State::Stopped)) => self.say(format!("{name} is already stopped"), DIM),
-                Some((name, _)) => return self.job(name, if c == 'X' { Verb::ForceStop } else { Verb::Stop }),
+                Some((name, _)) => return self.vm_job(name, if c == 'X' { Verb::ForceStop } else { Verb::Stop }),
                 None => {}
             },
             KeyCode::Char('p') => match self.target() {
-                Some((name, State::Running)) => return self.job(name, Verb::Pause),
-                Some((name, State::Paused)) => return self.job(name, Verb::Resume),
+                Some((name, State::Running)) => return self.vm_job(name, Verb::Pause),
+                Some((name, State::Paused)) => return self.vm_job(name, Verb::Resume),
                 Some((name, state)) => self.say(format!("{name} is {state}; only running VMs can pause"), DIM),
                 None => {}
             },
             KeyCode::Char('d') => {
-                // A broken VM can't be loaded to delete it, so say why instead.
+                // A broken VM can't be loaded to delete it, so `target` says why instead.
                 if let Some((name, _)) = self.target() {
-                    self.modal = Some(Modal::Delete(name));
+                    self.modal = Some(Modal::DeleteVm(name));
                 }
             }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn image_key(&mut self, key: KeyEvent) -> Action {
+        if navigate(&mut self.image_table, key.code, self.images.len()) {
+            return Action::None;
+        }
+        if key.code == KeyCode::Char('a') {
+            self.modal = Some(Modal::AddImage(Box::new(AddImageForm::new(&self.home))));
+            return Action::None;
+        }
+        let Some(info) = self.selected_image() else {
+            if key.code == KeyCode::Char('n') {
+                self.open_new(None);
+            }
+            return Action::None;
+        };
+        let (name, size, on_disk, custom) = (info.name.clone(), info.size, info.on_disk, info.custom);
+        let downloading = info.downloading.is_some();
+        let native = info.native;
+        if let Some(busy) = self.busy.get(&Target::Image(name.clone()))
+            && matches!(key.code, KeyCode::Char('p' | 'd'))
+        {
+            self.say(format!("{name} is busy {}", busy.verb.doing()), WARN);
+            return Action::None;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('n') => self.open_new(Some(name)),
+            KeyCode::Char('p') if custom || on_disk > 0 => self.say(format!("{name} is already on disk"), DIM),
+            KeyCode::Char('p') if downloading => self.say(format!("{name} is already downloading"), DIM),
+            KeyCode::Char('p') if !native => {
+                self.say(format!("{name} has no {} build", self.host), WARN);
+            }
+            KeyCode::Char('p') => {
+                let args = vec!["images".into(), "pull".into(), name.clone()];
+                return self.job(Target::Image(name), Verb::Pull, args);
+            }
+            KeyCode::Char('d') if !custom && on_disk == 0 => self.say(format!("{name} isn't downloaded"), DIM),
+            KeyCode::Char('d') => self.modal = Some(Modal::DeleteImage { name, size: on_disk.max(size), custom }),
             _ => {}
         }
         Action::None
@@ -426,99 +648,177 @@ impl App {
             self.status = None;
         }
         let area = frame.area();
+        let counts = self.counts();
+        // The message gets what's left of the top border after the tabs and the counts.
+        let room = (area.width as usize).saturating_sub(counts.width() + 24);
         let mut block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(BORDER)
-            .title(self.title())
+            .title(self.title(room))
+            .title(counts.right_aligned())
             .title_bottom(self.hints());
-        if let Some(counts) = self.counts() {
-            block = block.title(counts.right_aligned());
+        if self.error.is_some() && self.view == View::Vms {
+            block = block.border_style(Style::new().fg(Color::Red));
         }
         let inner = block.inner(area);
         frame.render_widget(block, area);
         // One column of breathing room inside the box.
         let body = inner.inner(Margin { horizontal: 1, vertical: 0 });
 
-        match &self.vms {
-            None => frame.render_widget(Paragraph::new(Line::styled("loading…", DIM)), body),
-            Some(vms) if vms.is_empty() => draw_empty(frame, body),
-            Some(vms) => {
-                let spinner = SPINNER[self.tick % SPINNER.len()];
-                let busy: HashMap<&str, Verb> = self.busy.iter().map(|(n, b)| (n.as_str(), b.verb)).collect();
-                frame.render_stateful_widget(table(vms, self.table.selected(), &busy, spinner), body, &mut self.table);
-                // Rows below the header; a scrollbar on the box's edge when they don't all fit.
-                let visible = body.height.saturating_sub(1) as usize;
-                if vms.len() > visible {
-                    let mut scroll = ScrollbarState::new(vms.len().saturating_sub(visible))
-                        .position(self.table.offset())
-                        .viewport_content_length(visible);
-                    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                        .begin_symbol(None)
-                        .end_symbol(None)
-                        .track_symbol(Some("│"))
-                        .thumb_symbol("┃")
-                        .track_style(BORDER)
-                        .thumb_style(Style::new().fg(Color::Cyan));
-                    let track = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..area };
-                    frame.render_stateful_widget(bar, track, &mut scroll);
+        let spinner = SPINNER[self.tick % SPINNER.len()];
+        let rows = match self.view {
+            View::Vms => match &self.vms {
+                None => {
+                    frame.render_widget(Paragraph::new(Line::styled("loading…", DIM)), body);
+                    0
                 }
+                Some(vms) if vms.is_empty() && self.pending().is_empty() => {
+                    draw_empty(frame, body);
+                    0
+                }
+                Some(vms) => {
+                    let table = self.vm_table(vms, spinner);
+                    frame.render_stateful_widget(table, body, &mut self.table);
+                    vms.len()
+                }
+            },
+            View::Images => {
+                let table = self.image_table(spinner);
+                frame.render_stateful_widget(table, body, &mut self.image_table);
+                self.images.len()
             }
+        };
+        // A scrollbar on the box's edge when the rows don't all fit below the header.
+        let visible = body.height.saturating_sub(1) as usize;
+        if rows > visible {
+            let offset = match self.view {
+                View::Vms => self.table.offset(),
+                View::Images => self.image_table.offset(),
+            };
+            let mut scroll = ScrollbarState::new(rows.saturating_sub(visible)).position(offset).viewport_content_length(visible);
+            let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .track_style(BORDER)
+                .thumb_style(Style::new().fg(Color::Cyan));
+            let track = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..area };
+            frame.render_stateful_widget(bar, track, &mut scroll);
         }
 
-        match &self.modal {
+        match &mut self.modal {
             Some(Modal::Help) => draw_help(frame, area),
-            Some(Modal::Delete(name)) => draw_delete(frame, area, name),
+            Some(Modal::DeleteVm(name)) => {
+                let what = vec![Span::raw("Delete "), Span::styled(name.clone(), HEADER), Span::raw(" and its disk?")];
+                draw_confirm(frame, area, what, "Cached images are kept.");
+            }
+            Some(Modal::DeleteImage { name, size, custom }) => {
+                let what = vec![Span::raw("Delete "), Span::styled(name.clone(), HEADER), Span::raw(format!(" ({})?", bytes(*size)))];
+                let note = if *custom { "It was added by you; the original file isn't touched." } else { "VMs keep their own disks; you can download it again." };
+                draw_confirm(frame, area, what, note);
+            }
+            Some(Modal::New(form)) => {
+                // The form brings its own margin.
+                let inner = dialog(frame, area, 80, form.height() + 4, "new VM", BORDER, 0);
+                form.render(frame, inner);
+            }
+            Some(Modal::AddImage(form)) => {
+                let inner = dialog(frame, area, 72, AddImageForm::HEIGHT + 4, "add image", BORDER, 2);
+                form.render(frame, inner);
+            }
             None => {}
         }
     }
 
-    /// `vx`, then the latest message, in the top border.
-    fn title(&self) -> Line<'static> {
-        let mut spans = vec![Span::styled("─ ", BORDER), Span::styled("vx", ACCENT), Span::raw(" ")];
-        if let Some(status) = &self.status {
+    /// `vx`, the two views with the current one bold, then the latest message (cut to `room`).
+    fn title(&self, room: usize) -> Line<'static> {
+        let tab = |name: &'static str, view: View| {
+            if self.view == view { Span::styled(name, HEADER) } else { Span::styled(name, DIM) }
+        };
+        let mut spans = vec![
+            Span::styled("─ ", BORDER),
+            Span::styled("vx", ACCENT),
+            Span::styled(" ─ ", BORDER),
+            tab("VMs", View::Vms),
+            Span::styled(" · ", BORDER),
+            tab("images", View::Images),
+            Span::raw(" "),
+        ];
+        if let Some(status) = &self.status
+            && room > 4
+        {
             spans.push(Span::styled("─ ", BORDER));
-            spans.push(Span::styled(status.text.clone(), status.style));
+            spans.push(Span::styled(clip(&status.text, room), status.style));
             spans.push(Span::raw(" "));
         }
         Line::from(spans)
     }
 
-    /// `2 VMs · 1 running`, in the top border.
-    fn counts(&self) -> Option<Line<'static>> {
-        if let Some(error) = &self.error {
-            return Some(Line::from(vec![Span::styled(format!(" {error}"), ERROR), Span::styled(" ─", BORDER)]));
-        }
-        let vms = self.vms.as_ref()?;
-        let running = vms.iter().filter(|e| matches!(e.vm, Ok((_, State::Running)))).count();
-        let plural = if vms.len() == 1 { "" } else { "s" };
-        Some(Line::from(vec![
-            Span::styled(format!(" {} VM{plural} · ", vms.len()), DIM),
-            Span::styled(format!("{running} running"), if running > 0 { OK } else { DIM }),
-            Span::styled(" ─", BORDER),
-        ]))
-    }
-
-    /// Keys for what the selected VM can do, in the bottom border.
-    fn hints(&self) -> Line<'static> {
-        let mut spans = vec![Span::styled("─ ", BORDER)];
-        let entry = self.selected();
-        let mut keys: Vec<(&str, &str)> = Vec::new();
-        match entry.map(|e| (&e.name, &e.vm)) {
-            Some((name, Err(e))) => {
-                spans.push(Span::styled(format!("{name}: {e}"), ERROR));
-                spans.push(Span::styled(" · ", BORDER));
-            }
-            Some((name, Ok((_, state)))) if !self.busy.contains_key(name) => {
-                keys.push(("⏎", "ssh"));
-                match state {
-                    State::Stopped => keys.extend([("s", "start"), ("d", "delete")]),
-                    State::Paused => keys.extend([("p", "resume"), ("x", "stop")]),
-                    _ => keys.extend([("c", "console"), ("x", "stop"), ("p", "pause")]),
+    /// Totals for the current view, in the top border.
+    fn counts(&self) -> Line<'static> {
+        let mut spans = Vec::new();
+        match self.view {
+            View::Vms => {
+                if let Some(error) = &self.error {
+                    spans.push(Span::styled(format!(" {error}"), ERROR));
+                } else if let Some(vms) = &self.vms {
+                    let running = vms.iter().filter(|e| matches!(e.vm, Ok((_, State::Running)))).count();
+                    let plural = if vms.len() == 1 { "" } else { "s" };
+                    spans.push(Span::styled(format!(" {} VM{plural} · ", vms.len()), DIM));
+                    spans.push(Span::styled(format!("{running} running"), if running > 0 { OK } else { DIM }));
                 }
             }
-            _ => {}
+            View::Images => {
+                let kept = self.images.iter().filter(|i| i.on_disk > 0).count();
+                let total: u64 = self.images.iter().map(|i| i.on_disk).sum();
+                spans.push(Span::styled(format!(" {} images · {kept} on disk · {}", self.images.len(), bytes(total)), DIM));
+            }
         }
-        keys.extend([("n", "new"), ("?", "keys"), ("q", "quit")]);
+        if !spans.is_empty() {
+            spans.push(Span::styled(" ─", BORDER));
+        }
+        Line::from(spans)
+    }
+
+    /// Keys for what the selection can do, in the bottom border.
+    fn hints(&self) -> Line<'static> {
+        let mut spans = vec![Span::styled("─ ", BORDER)];
+        let mut keys: Vec<(&str, &str)> = Vec::new();
+        match self.view {
+            View::Vms => match self.selected().map(|e| (&e.name, &e.vm)) {
+                Some((name, Err(e))) => {
+                    spans.push(Span::styled(format!("{name}: {e}"), ERROR));
+                    spans.push(Span::styled(" · ", BORDER));
+                }
+                Some((name, Ok((_, state)))) if !self.busy.contains_key(&Target::Vm(name.clone())) => {
+                    keys.push(("⏎", "ssh"));
+                    match state {
+                        State::Stopped => keys.extend([("s", "start"), ("d", "delete")]),
+                        State::Paused => keys.extend([("p", "resume"), ("x", "stop")]),
+                        _ => keys.extend([("x", "stop"), ("p", "pause")]),
+                    }
+                }
+                _ => {}
+            },
+            View::Images => {
+                if let Some(info) = self.selected_image() {
+                    keys.push(("⏎", "new VM"));
+                    if !info.custom && info.on_disk == 0 && info.downloading.is_none() && info.native {
+                        keys.push(("p", "download"));
+                    }
+                    if info.custom || info.on_disk > 0 {
+                        keys.push(("d", "delete"));
+                    }
+                }
+                keys.push(("a", "add"));
+            }
+        }
+        if self.view == View::Vms {
+            keys.push(("n", "new"));
+        }
+        let other = if self.view == View::Vms { "images" } else { "VMs" };
+        keys.extend([("tab", other), ("?", "keys"), ("q", "quit")]);
         for (i, (key, what)) in keys.into_iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(" · ", BORDER));
@@ -529,16 +829,257 @@ impl App {
         spans.push(Span::raw(" "));
         Line::from(spans)
     }
+
+    /// VMs being created that don't have a directory yet, by name.
+    fn pending(&self) -> Vec<(&str, &Pending)> {
+        let exists = |name: &str| self.vms.iter().flatten().any(|e| e.name == name);
+        let mut pending: Vec<(&str, &Pending)> = self
+            .busy
+            .iter()
+            .filter_map(|(target, busy)| match (target, &busy.pending) {
+                (Target::Vm(name), Some(p)) if !busy.done && !exists(name) => Some((name.as_str(), p)),
+                _ => None,
+            })
+            .collect();
+        pending.sort_by_key(|(name, _)| *name);
+        pending
+    }
+
+    /// `↓ 30%` while `image` downloads.
+    fn download_progress(&self, image: &str) -> Option<String> {
+        let info = self.images.iter().find(|i| i.name == image)?;
+        let done = info.downloading?;
+        // The catalog's size is approximate, so never claim 100% before it's done.
+        Some(format!("↓ {}%", (done * 100 / info.size.max(1)).min(99)))
+    }
+
+    /// What to show in place of a busy VM's state.
+    fn vm_busy_label(&self, name: &str) -> Option<String> {
+        let busy = self.busy.get(&Target::Vm(name.into()))?;
+        if busy.verb != Verb::Create {
+            return Some(busy.verb.doing().into());
+        }
+        if self.vms.iter().flatten().any(|e| e.name == name) {
+            return Some("booting".into());
+        }
+        let image = busy.pending.as_ref().map(|p| p.image.as_str()).unwrap_or_default();
+        Some(self.download_progress(image).unwrap_or_else(|| "creating".into()))
+    }
+
+    /// The selected row is a dark bar; its text is forced to white so it reads on light themes too.
+    fn vm_table(&self, vms: &[Entry], spinner: char) -> Table<'static> {
+        let selected = self.table.selected();
+        let right = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
+        let mut rows: Vec<Row> = vms
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let text = if selected == Some(i) { SELECTED_TEXT } else { Style::new() };
+                let quiet = if selected == Some(i) { SELECTED_TEXT } else { DIM };
+                let row = match &entry.vm {
+                    Ok((spec, state)) => {
+                        let state = match self.vm_busy_label(&entry.name) {
+                            Some(label) => Line::styled(format!("{spinner} {label}"), BUSY),
+                            None => state_line(state),
+                        };
+                        vec![
+                            Cell::from(clip(&entry.name, NAME_MAX)),
+                            Cell::from(state),
+                            Cell::from(clip(&spec.image, IMAGE_MAX)),
+                            Cell::from(spec.arch.to_string()),
+                            right(spec.cpus.to_string()),
+                            right(spec.memory.clone()),
+                            Cell::from(Span::styled(format!("127.0.0.1:{}", spec.ssh.port), quiet)),
+                        ]
+                    }
+                    // The full error shows in the bottom border when the row is selected.
+                    Err(_) => vec![Cell::from(clip(&entry.name, NAME_MAX)), Cell::from(Span::styled("✗ broken", ERROR))],
+                };
+                Row::new(row).style(text)
+            })
+            .collect();
+        // VMs still being created come last, until their directory appears.
+        for (name, p) in self.pending() {
+            let label = self.vm_busy_label(name).unwrap_or_default();
+            rows.push(Row::new(vec![
+                Cell::from(clip(name, NAME_MAX)),
+                Cell::from(Line::styled(format!("{spinner} {label}"), BUSY)),
+                Cell::from(clip(&p.image, IMAGE_MAX)),
+                Cell::from(p.arch.to_string()),
+                right(p.cpus.clone()),
+                right(p.memory.clone()),
+                Cell::from(""),
+            ]));
+        }
+        let pending = self.pending();
+        let names = vms.iter().map(|e| e.name.chars().count()).chain(pending.iter().map(|(n, _)| n.chars().count()));
+        let images = vms
+            .iter()
+            .map(|e| e.vm.as_ref().map_or(0, |(s, _)| s.image.chars().count()))
+            .chain(pending.iter().map(|(_, p)| p.image.chars().count()));
+        let widths = [
+            Constraint::Length(names.max().unwrap_or(0).clamp(4, NAME_MAX) as u16),
+            Constraint::Length(10),
+            Constraint::Length(images.max().unwrap_or(0).clamp(5, IMAGE_MAX) as u16),
+            Constraint::Length(7),
+            Constraint::Length(4),
+            Constraint::Length(6),
+            Constraint::Fill(1),
+        ];
+        let header = Row::new(vec![
+            Cell::from("NAME"),
+            Cell::from("STATE"),
+            Cell::from("IMAGE"),
+            Cell::from("ARCH"),
+            right("CPUS".into()),
+            right("MEMORY".into()),
+            Cell::from("SSH"),
+        ])
+        .style(HEADER);
+        Table::new(rows, widths).header(header).column_spacing(2).row_highlight_style(SELECTED)
+    }
+
+    fn image_table(&self, spinner: char) -> Table<'static> {
+        let selected = self.image_table.selected();
+        let right = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
+        let mut rows: Vec<Row> = self
+            .images
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                let text = if selected == Some(i) { SELECTED_TEXT } else { Style::new() };
+                let busy = self.busy.get(&Target::Image(info.name.clone()));
+                let on_disk = match (busy, self.download_progress(&info.name)) {
+                    (_, Some(progress)) => Line::styled(format!("{spinner} {progress}"), BUSY),
+                    // Fetching the checksum, before the first bytes arrive.
+                    (Some(busy), None) if busy.verb == Verb::Pull => Line::styled(format!("{spinner} ↓ 0%"), BUSY),
+                    (Some(busy), None) => Line::styled(format!("{spinner} {}", busy.verb.doing()), BUSY),
+                    (None, None) if info.on_disk > 0 => Line::styled(bytes(info.on_disk), OK),
+                    (None, None) => Line::styled("-", DIM),
+                };
+                let note = if info.name == image::DEFAULT {
+                    Span::styled("default", DIM)
+                } else if info.custom {
+                    Span::styled("custom", BUSY)
+                } else if !info.native {
+                    Span::styled(format!("{} only", other(self.host)), WARN)
+                } else {
+                    Span::raw("")
+                };
+                let size = if info.custom { bytes(info.size) } else { format!("~{}", bytes(info.size)) };
+                Row::new(vec![
+                    Cell::from(clip(&info.name, IMAGE_NAME_MAX)),
+                    Cell::from(clip(&info.title, 20)),
+                    right(size),
+                    Cell::from(on_disk),
+                    Cell::from(note),
+                ])
+                .style(text)
+            })
+            .collect();
+        // Images being added come last, until they've been copied.
+        let mut adding: Vec<&str> = self
+            .busy
+            .iter()
+            .filter(|(t, b)| b.verb == Verb::AddImage && !self.images.iter().any(|i| i.name == t.name()))
+            .map(|(t, _)| t.name())
+            .collect();
+        adding.sort();
+        for name in adding {
+            rows.push(Row::new(vec![
+                Cell::from(clip(name, IMAGE_NAME_MAX)),
+                Cell::from("added by you"),
+                Cell::from(""),
+                Cell::from(Line::styled(format!("{spinner} copying"), BUSY)),
+                Cell::from(Span::styled("custom", BUSY)),
+            ]));
+        }
+        let name_w = self.images.iter().map(|i| i.name.chars().count()).max().unwrap_or(0).clamp(5, IMAGE_NAME_MAX);
+        let widths = [
+            Constraint::Length(name_w as u16),
+            Constraint::Length(20),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Fill(1),
+        ];
+        let header = Row::new(vec![
+            Cell::from("IMAGE"),
+            Cell::from("DESCRIPTION"),
+            right("SIZE".into()),
+            Cell::from("ON DISK"),
+            Cell::from(""),
+        ])
+        .style(HEADER);
+        Table::new(rows, widths).header(header).column_spacing(2).row_highlight_style(SELECTED)
+    }
 }
 
-/// Run `vx <verb> <name>` on a thread, in its own process group so Ctrl-C in an ssh
-/// session can't interrupt it, and report how it went.
-fn spawn_job(io: &Io, name: String, verb: Verb) {
+/// ↑↓ j k, Home End g G. Returns whether the key moved the selection.
+fn navigate(table: &mut TableState, code: KeyCode, len: usize) -> bool {
+    if len == 0 {
+        return matches!(code, KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k'));
+    }
+    let next = |i: Option<usize>| Some(i.map_or(0, |i| (i + 1).min(len - 1)));
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => table.select_previous(),
+        KeyCode::Down | KeyCode::Char('j') => table.select(next(table.selected())),
+        KeyCode::Home | KeyCode::Char('g') => table.select_first(),
+        KeyCode::End | KeyCode::Char('G') => table.select(Some(len - 1)),
+        _ => return false,
+    }
+    true
+}
+
+/// The row to select after the list changed: the same item if it's still there, otherwise
+/// the same position, kept in range.
+fn keep_in_range(found: Option<usize>, before: Option<usize>, len: usize) -> Option<usize> {
+    match (found, before) {
+        (Some(i), _) => Some(i),
+        (None, _) if len == 0 => None,
+        (None, Some(i)) => Some(i.min(len - 1)),
+        (None, None) => Some(0),
+    }
+}
+
+fn other(arch: Arch) -> Arch {
+    match arch {
+        Arch::Aarch64 => Arch::X86_64,
+        Arch::X86_64 => Arch::Aarch64,
+    }
+}
+
+fn state_line(state: &State) -> Line<'static> {
+    let (dot, color) = match state {
+        State::Running => ("●", OK),
+        State::Stopped => ("○", DIM),
+        _ => ("◐", WARN),
+    };
+    Line::from(vec![Span::styled(dot, color), Span::styled(format!(" {state}"), color)])
+}
+
+/// The `vx new` arguments for what the form produced.
+fn new_argv(args: &NewArgs) -> Vec<String> {
+    let mut argv = vec!["new".to_string(), args.name.clone().unwrap_or_default()];
+    argv.extend(["--image".into(), args.image.clone(), "--disk".into(), args.disk.clone()]);
+    if let Some(cpus) = args.cpus {
+        argv.extend(["--cpus".into(), cpus.to_string()]);
+    }
+    if let Some(mem) = &args.mem {
+        argv.extend(["--mem".into(), mem.clone()]);
+    }
+    if let Some(arch) = args.arch {
+        argv.extend(["--arch".into(), arch.to_string()]);
+    }
+    argv
+}
+
+/// Run `vx <args>` on a thread, in its own process group so Ctrl-C in an ssh session can't
+/// interrupt it, and report how it went.
+fn spawn_job(io: &Io, job: Job) {
     let (tx, exe, home) = (io.tx.clone(), io.exe.clone(), io.home.clone());
     thread::spawn(move || {
         let output = Command::new(exe)
-            .args(verb.args())
-            .arg(&name)
+            .args(&job.args)
             .env("VX_HOME", home)
             .stdin(Stdio::null())
             .process_group(0)
@@ -548,7 +1089,7 @@ fn spawn_job(io: &Io, name: String, verb: Verb) {
             Ok(out) => Err(error_line(&String::from_utf8_lossy(&out.stderr))),
             Err(e) => Err(e.to_string()),
         };
-        let _ = tx.send(Msg::Done { name, verb, result });
+        let _ = tx.send(Msg::Done { target: job.target, verb: job.verb, result });
     });
 }
 
@@ -588,72 +1129,16 @@ fn suspend(terminal: &mut DefaultTerminal, run: impl FnOnce() -> Result<()>) -> 
     result
 }
 
-/// The selected row is a dark bar; its text is forced to white so it reads on light themes too.
-fn table(vms: &[Entry], selected: Option<usize>, busy: &HashMap<&str, Verb>, spinner: char) -> Table<'static> {
-    let right = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
-    let rows = vms.iter().enumerate().map(|(i, entry)| {
-        let text = if selected == Some(i) { SELECTED_TEXT } else { Style::new() };
-        let quiet = if selected == Some(i) { SELECTED_TEXT } else { DIM };
-        let row = match &entry.vm {
-            Ok((spec, state)) => {
-                let state = match busy.get(entry.name.as_str()) {
-                    Some(verb) => Line::styled(format!("{spinner} {}", verb.doing()), BUSY),
-                    None => {
-                        let (dot, color) = match state {
-                            State::Running => ("●", OK),
-                            State::Stopped => ("○", DIM),
-                            _ => ("◐", WARN),
-                        };
-                        Line::from(vec![Span::styled(dot, color), Span::styled(format!(" {state}"), color)])
-                    }
-                };
-                vec![
-                    Cell::from(clip(&entry.name, NAME_MAX)),
-                    Cell::from(state),
-                    Cell::from(clip(&spec.image, IMAGE_MAX)),
-                    Cell::from(spec.arch.to_string()),
-                    right(spec.cpus.to_string()),
-                    right(spec.memory.clone()),
-                    Cell::from(Span::styled(format!("127.0.0.1:{}", spec.ssh.port), quiet)),
-                ]
-            }
-            // The full error shows in the bottom border when the row is selected.
-            Err(_) => vec![Cell::from(clip(&entry.name, NAME_MAX)), Cell::from(Span::styled("✗ broken", ERROR))],
-        };
-        Row::new(row).style(text)
-    });
-    let width = |f: fn(&Entry) -> usize, min: usize, max: usize| vms.iter().map(f).max().unwrap_or(0).clamp(min, max) as u16;
-    let widths = [
-        Constraint::Length(width(|e| e.name.chars().count(), 4, NAME_MAX)),
-        Constraint::Length(10),
-        Constraint::Length(width(|e| e.vm.as_ref().map_or(0, |(s, _)| s.image.chars().count()), 5, IMAGE_MAX)),
-        Constraint::Length(7),
-        Constraint::Length(4),
-        Constraint::Length(6),
-        Constraint::Fill(1),
-    ];
-    let header = Row::new(vec![
-        Cell::from("NAME"),
-        Cell::from("STATE"),
-        Cell::from("IMAGE"),
-        Cell::from("ARCH"),
-        right("CPUS".into()),
-        right("MEMORY".into()),
-        Cell::from("SSH"),
-    ])
-    .style(HEADER);
-    Table::new(rows, widths).header(header).column_spacing(2).row_highlight_style(SELECTED)
-}
-
 /// Columns wider than this end in `…`, so one long name can't push the rest off screen.
 const NAME_MAX: usize = 24;
 const IMAGE_MAX: usize = 18;
+const IMAGE_NAME_MAX: usize = 20;
 
 fn clip(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
-    let mut clipped: String = text.chars().take(max - 1).collect();
+    let mut clipped: String = text.chars().take(max.saturating_sub(1)).collect();
     clipped.push('…');
     clipped
 }
@@ -669,46 +1154,61 @@ fn draw_empty(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(text), middle);
 }
 
-/// A rounded box of `width` × `height` in the middle of `area`, cleared, with `title`.
-fn dialog(frame: &mut Frame, area: Rect, width: u16, height: u16, title: Line<'static>, border: Style) -> Rect {
+/// A rounded box of up to `width` × `height` in the middle of `area`, cleared, with `title`.
+/// Returns the space inside it, after `pad` columns of padding on each side.
+fn dialog(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &str, border: Style, pad: u16) -> Rect {
+    let width = width.min(area.width.saturating_sub(2));
+    let height = height.min(area.height.saturating_sub(2));
     let [row] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(area);
     let [rect] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(row);
     frame.render_widget(Clear, rect);
+    let title_style = if border == BORDER { ACCENT } else { border };
+    let title = Line::from(vec![Span::styled("─ ", border), Span::styled(title.to_string(), title_style), Span::raw(" ")]);
     let block = Block::bordered().border_type(BorderType::Rounded).border_style(border).title(title);
-    let inner = block.inner(rect).inner(Margin { horizontal: 2, vertical: 1 });
+    let inner = block.inner(rect).inner(Margin { horizontal: pad, vertical: 1 });
     frame.render_widget(block, rect);
     inner
 }
 
 const HELP: &[(&str, &str)] = &[
+    ("", "VMs"),
     ("⏎", "ssh in, starting it first if needed"),
     ("c", "serial console · Ctrl-] returns"),
     ("l", "boot log · Ctrl-C returns"),
-    ("s", "start"),
-    ("x / X", "stop / force it off"),
+    ("s x X", "start · stop · force off"),
     ("p", "pause or resume"),
     ("n", "new VM"),
     ("d", "delete"),
+    ("", ""),
+    ("", "images"),
+    ("⏎", "new VM from it"),
+    ("p", "download it now"),
+    ("a", "add a disk image of your own"),
+    ("d", "delete its copy"),
+    ("", ""),
+    ("tab", "switch between VMs and images"),
     ("↑↓ j k", "select · g G first / last"),
     ("q", "quit"),
 ];
 
 fn draw_help(frame: &mut Frame, area: Rect) {
-    let title = Line::from(vec![Span::styled("─ ", BORDER), Span::styled("keys", ACCENT), Span::raw(" ")]);
-    let inner = dialog(frame, area, 48, HELP.len() as u16 + 4, title, BORDER);
+    let inner = dialog(frame, area, 50, HELP.len() as u16 + 4, "keys", BORDER, 2);
     let lines: Vec<Line> = HELP
         .iter()
-        .map(|(key, what)| Line::from(vec![Span::styled(format!("{key:8}"), ACCENT), Span::raw(*what)]))
+        .map(|(key, what)| match *key {
+            "" => Line::styled(*what, HEADER),
+            _ => Line::from(vec![Span::styled(format!("{key:8}"), ACCENT), Span::raw(*what)]),
+        })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_delete(frame: &mut Frame, area: Rect, name: &str) {
-    let title = Line::from(vec![Span::styled("─ ", ERROR), Span::styled("delete", ERROR), Span::raw(" ")]);
-    let inner = dialog(frame, area, 46, 7, title, ERROR);
+fn draw_confirm(frame: &mut Frame, area: Rect, what: Vec<Span<'static>>, note: &str) {
+    let width = (note.chars().count() as u16 + 8).max(46);
+    let inner = dialog(frame, area, width, 8, "delete", ERROR, 2);
     let lines = vec![
-        Line::from(vec![Span::raw("Delete "), Span::styled(name.to_string(), HEADER), Span::raw(" and its disk?")]),
-        Line::styled("Cached images are kept.", DIM),
+        Line::from(what),
+        Line::styled(note.to_string(), DIM),
         Line::default(),
         Line::from(vec![
             Span::styled("y", ACCENT),
@@ -723,7 +1223,6 @@ fn draw_delete(frame: &mut Frame, area: Rect, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::Arch;
     use crate::vx::SshSpec;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -743,6 +1242,18 @@ mod tests {
         Entry { name: name.into(), vm: Ok((spec, state)) }
     }
 
+    fn info(name: &str, on_disk: u64, custom: bool, native: bool) -> Info {
+        Info {
+            name: name.into(),
+            title: if custom { "added by you".into() } else { format!("{name} title") },
+            size: 300_000_000,
+            on_disk,
+            downloading: None,
+            custom,
+            native,
+        }
+    }
+
     fn screen(app: &mut App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -757,6 +1268,12 @@ mod tests {
         KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE }
     }
 
+    fn typed(app: &mut App, text: &str) {
+        for c in text.chars() {
+            let _ = app.key(press(KeyCode::Char(c)));
+        }
+    }
+
     fn vms() -> Vec<Entry> {
         vec![
             entry("dev", State::Running, "debian-13", 2222),
@@ -765,39 +1282,70 @@ mod tests {
         ]
     }
 
+    fn home() -> Home {
+        Home::at(std::env::temp_dir().join(format!("vx-tui-{}", std::process::id())))
+    }
+
     fn with_vms() -> App {
-        let mut app = App::default();
+        let mut app = App::new(&home(), Arch::Aarch64);
         app.update(vms());
+        app.update_images(vec![
+            info("debian-13", 337_000_000, false, true),
+            info("ubuntu-24.04", 0, false, true),
+            info("archlinux", 0, false, false),
+            info("mine", 1_000_000_000, true, true),
+        ]);
         app
     }
 
+    const VM_GOLDEN: &str = "\
+╭─ vx ─ VMs · images ────────────────────────────────────── 3 VMs · 1 running ─╮
+│ NAME  STATE       IMAGE      ARCH     CPUS  MEMORY  SSH                      │
+│ dev   ● running   debian-13  aarch64     4      4G  127.0.0.1:2222           │
+│ web   ○ stopped   fedora-44  aarch64     4      4G  127.0.0.1:2223           │
+│ old   ✗ broken                                                               │
+│                                                                              │
+╰─ ⏎ ssh · x stop · p pause · n new · tab images · ? keys · q quit ────────────╯";
+
+    const IMAGE_GOLDEN: &str = "\
+╭─ vx ─ VMs · images ────────────────────────── 4 images · 2 on disk · 1.3 GB ─╮
+│ IMAGE         DESCRIPTION               SIZE  ON DISK                        │
+│ debian-13     debian-13 title        ~300 MB  337 MB      default            │
+│ ubuntu-24.04  ubuntu-24.04 title     ~300 MB  -                              │
+│ archlinux     archlinux title        ~300 MB  -           x86_64 only        │
+│ mine          added by you            300 MB  1.0 GB      custom             │
+│                                                                              │
+│                                                                              │
+╰─ ⏎ new VM · d delete · a add · tab VMs · ? keys · q quit ────────────────────╯";
+
     #[test]
-    fn draws_the_table() {
+    fn draws_the_vm_table() {
         let mut app = with_vms();
-        assert_eq!(
-            screen(&mut app, 72, 7),
-            "╭─ vx ───────────────────────────────────────────── 3 VMs · 1 running ─╮
-│ NAME  STATE       IMAGE      ARCH     CPUS  MEMORY  SSH              │
-│ dev   ● running   debian-13  aarch64     4      4G  127.0.0.1:2222   │
-│ web   ○ stopped   fedora-44  aarch64     4      4G  127.0.0.1:2223   │
-│ old   ✗ broken                                                       │
-│                                                                      │
-╰─ ⏎ ssh · c console · x stop · p pause · n new · ? keys · q quit ─────╯"
-        );
+        assert_eq!(screen(&mut app, 80, 7), VM_GOLDEN);
         let _ = app.key(press(KeyCode::End));
-        assert!(screen(&mut app, 72, 7).contains("╰─ old: invalid vx.toml · n new · ? keys · q quit ─"));
+        assert!(screen(&mut app, 80, 7).contains("╰─ old: invalid vx.toml · n new · tab images · ? keys · q quit ─"));
     }
 
     #[test]
-    fn hints_follow_the_selected_state() {
+    fn draws_the_image_table() {
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Tab));
+        assert_eq!(screen(&mut app, 80, 9), IMAGE_GOLDEN);
+    }
+
+    #[test]
+    fn hints_follow_the_selection() {
         let mut app = with_vms();
         let _ = app.key(press(KeyCode::Down));
         assert!(screen(&mut app, 80, 7).contains("⏎ ssh · s start · d delete · n new"));
+        let _ = app.key(press(KeyCode::Tab));
+        let _ = app.key(press(KeyCode::Down)); // ubuntu-24.04: not downloaded
+        assert!(screen(&mut app, 80, 7).contains("⏎ new VM · p download · a add · tab VMs"));
     }
 
     #[test]
     fn shows_loading_then_empty() {
-        let mut app = App::default();
+        let mut app = App::new(&home(), Arch::Aarch64);
         assert!(screen(&mut app, 60, 6).contains("loading…"));
         app.update(vec![]);
         let text = screen(&mut app, 60, 8);
@@ -827,54 +1375,62 @@ mod tests {
         assert!(app.selected().is_none());
     }
 
+    fn job(app: &mut App, code: KeyCode) -> Option<Job> {
+        match app.key(press(code)) {
+            Action::Job(job) => Some(job),
+            _ => None,
+        }
+    }
+
     #[test]
-    fn actions_fit_the_state() {
+    fn vm_actions_fit_the_state() {
         let mut app = with_vms(); // `dev` is running
         assert_eq!(app.key(press(KeyCode::Enter)), Action::Run(Foreground::Ssh("dev".into())));
         assert_eq!(app.key(press(KeyCode::Char('c'))), Action::Run(Foreground::Console("dev".into())));
         assert_eq!(app.key(press(KeyCode::Char('l'))), Action::Run(Foreground::Logs("dev".into())));
-        assert_eq!(app.key(press(KeyCode::Char('n'))), Action::Run(Foreground::New));
         assert_eq!(app.key(press(KeyCode::Char('s'))), Action::None);
         assert_eq!(app.status.as_ref().unwrap().text, "dev is already running");
-        assert_eq!(app.key(press(KeyCode::Char('p'))), Action::Job("dev".into(), Verb::Pause));
+        let pause = job(&mut app, KeyCode::Char('p')).unwrap();
+        assert_eq!((pause.verb, pause.args), (Verb::Pause, vec!["pause".to_string(), "dev".into()]));
 
         let mut app = with_vms();
         let _ = app.key(press(KeyCode::Down)); // `web` is stopped
         assert_eq!(app.key(press(KeyCode::Char('c'))), Action::None);
         assert!(app.status.as_ref().unwrap().text.contains("press s to start it"));
         assert_eq!(app.key(press(KeyCode::Char('x'))), Action::None);
-        assert_eq!(app.key(press(KeyCode::Char('s'))), Action::Job("web".into(), Verb::Start));
+        assert_eq!(job(&mut app, KeyCode::Char('s')).unwrap().args, ["start", "web"]);
     }
 
     #[test]
     fn busy_vms_show_a_spinner_and_refuse_more_work() {
         let mut app = with_vms();
-        assert_eq!(app.key(press(KeyCode::Char('X'))), Action::Job("dev".into(), Verb::ForceStop));
-        assert!(screen(&mut app, 72, 7).contains(" stopping "));
+        assert_eq!(job(&mut app, KeyCode::Char('X')).unwrap().args, ["stop", "--force", "dev"]);
+        assert!(screen(&mut app, 80, 7).contains(" stopping "));
         assert_eq!(app.key(press(KeyCode::Char('x'))), Action::None);
         assert_eq!(app.status.as_ref().unwrap().text, "dev is busy stopping");
 
         // Done: the message shows at once, the spinner stays until a refresh brings the new state.
-        app.busy.get_mut("dev").unwrap().done = true;
+        app.busy.get_mut(&Target::Vm("dev".into())).unwrap().done = true;
         app.say("✓ dev stopped".into(), OK);
-        assert!(screen(&mut app, 72, 7).starts_with("╭─ vx ─ ✓ dev stopped ─"));
+        assert!(screen(&mut app, 80, 7).starts_with("╭─ vx ─ VMs · images ─ ✓ dev stopped ─"));
         app.update(vec![entry("dev", State::Stopped, "debian-13", 2222)]);
         assert!(app.busy.is_empty());
-        assert!(screen(&mut app, 72, 7).contains("○ stopped"));
+        assert!(screen(&mut app, 80, 7).contains("○ stopped"));
     }
 
     #[test]
     fn delete_asks_first() {
         let mut app = with_vms();
         let _ = app.key(press(KeyCode::Char('d')));
-        assert_eq!(app.modal, Some(Modal::Delete("dev".into())));
-        let text = screen(&mut app, 72, 12);
+        assert!(matches!(&app.modal, Some(Modal::DeleteVm(name)) if name == "dev"));
+        let text = screen(&mut app, 80, 12);
         assert!(text.contains("Delete dev and its disk?"), "{text}");
         assert_eq!(app.key(press(KeyCode::Char('z'))), Action::None); // ignored, still asking
+        assert!(app.modal.is_some());
         assert_eq!(app.key(press(KeyCode::Char('n'))), Action::None);
         assert!(app.modal.is_none());
         let _ = app.key(press(KeyCode::Char('d')));
-        assert_eq!(app.key(press(KeyCode::Char('y'))), Action::Job("dev".into(), Verb::Delete));
+        assert_eq!(job(&mut app, KeyCode::Char('y')).unwrap().args, ["rm", "-y", "dev"]);
     }
 
     #[test]
@@ -887,11 +1443,113 @@ mod tests {
     }
 
     #[test]
+    fn new_vm_form_creates_in_the_background() {
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Char('n')));
+        assert!(matches!(app.modal, Some(Modal::New(_))));
+        let text = screen(&mut app, 90, 24);
+        assert!(text.contains("─ new VM ─") && text.contains("Name") && text.contains("▸ debian-13"), "{text}");
+
+        // Typing goes to the form, not to the dashboard's keys.
+        let ctrl_u = KeyEvent { modifiers: KeyModifiers::CONTROL, ..press(KeyCode::Char('u')) };
+        let _ = app.key(ctrl_u);
+        typed(&mut app, "box");
+        let create = job(&mut app, KeyCode::Enter).unwrap();
+        assert_eq!(create.target, Target::Vm("box".into()));
+        assert_eq!(&create.args[..5], ["new", "box", "--image", "debian-13", "--disk"]);
+        assert!(app.modal.is_none());
+
+        // It shows as a row right away, and is selected once it exists.
+        assert!(screen(&mut app, 80, 8).contains(" creating "), "{}", screen(&mut app, 80, 8));
+        let mut now = vms();
+        now.push(entry("box", State::Running, "debian-13", 2224));
+        app.update(now);
+        assert_eq!(app.selected().unwrap().name, "box");
+        assert!(screen(&mut app, 80, 8).contains(" booting "));
+    }
+
+    #[test]
+    fn new_vm_dialog_fits_80_columns() {
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Char('n')));
+        let _ = app.key(press(KeyCode::Tab));
+        for _ in 0..14 {
+            let _ = app.key(press(KeyCode::Down));
+        }
+        let text = screen(&mut app, 80, 24);
+        assert!(text.contains("▸ archlinux            Arch Linux             578 MB  x86_64 only"), "{text}");
+    }
+
+    #[test]
+    fn escape_closes_the_form_without_quitting() {
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Char('n')));
+        assert_eq!(app.key(press(KeyCode::Esc)), Action::None);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn image_actions_fit_the_image() {
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Tab));
+        // debian-13 is on disk: no download, but delete asks first.
+        assert_eq!(app.key(press(KeyCode::Char('p'))), Action::None);
+        assert_eq!(app.status.as_ref().unwrap().text, "debian-13 is already on disk");
+        let _ = app.key(press(KeyCode::Char('d')));
+        assert!(screen(&mut app, 80, 14).contains("Delete debian-13 (337 MB)?"));
+        assert_eq!(job(&mut app, KeyCode::Char('y')).unwrap().args, ["images", "rm", "debian-13"]);
+
+        let _ = app.key(press(KeyCode::Down)); // ubuntu-24.04, not downloaded
+        assert_eq!(job(&mut app, KeyCode::Char('p')).unwrap().args, ["images", "pull", "ubuntu-24.04"]);
+        assert!(screen(&mut app, 80, 8).contains(" ↓ 0%"));
+        assert_eq!(app.key(press(KeyCode::Char('d'))), Action::None);
+        assert_eq!(app.status.as_ref().unwrap().text, "ubuntu-24.04 is busy downloading");
+
+        let _ = app.key(press(KeyCode::Down)); // archlinux, no aarch64 build
+        assert_eq!(app.key(press(KeyCode::Char('p'))), Action::None);
+        assert_eq!(app.status.as_ref().unwrap().text, "archlinux has no aarch64 build");
+
+        // ⏎ opens the new-VM form with this image chosen.
+        let _ = app.key(press(KeyCode::Up));
+        let _ = app.key(press(KeyCode::Up));
+        let _ = app.key(press(KeyCode::Enter));
+        let text = screen(&mut app, 90, 24);
+        assert!(text.contains("▸ debian-13"), "{text}");
+    }
+
+    #[test]
+    fn download_progress_shows_in_both_views() {
+        let mut app = with_vms();
+        let mut images = app.images.clone_for_test();
+        images[1].downloading = Some(150_000_000);
+        app.update_images(images);
+        let _ = app.key(press(KeyCode::Tab));
+        assert!(screen(&mut app, 80, 8).contains("↓ 50%"));
+    }
+
+    #[test]
+    fn add_image_form() {
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Tab));
+        let _ = app.key(press(KeyCode::Char('a')));
+        assert!(screen(&mut app, 80, 14).contains("─ add image ─"));
+        let file = std::env::temp_dir().join(format!("vx-tui-{} My Disk.qcow2", std::process::id()));
+        std::fs::write(&file, b"").unwrap();
+        typed(&mut app, &file.display().to_string());
+        let add = job(&mut app, KeyCode::Enter);
+        std::fs::remove_file(&file).unwrap();
+        let add = add.unwrap();
+        let name = format!("vx-tui-{}-my-disk", std::process::id());
+        assert_eq!(add.args, ["images".to_string(), "add".into(), name.clone(), file.display().to_string()]);
+        assert!(screen(&mut app, 80, 9).contains(" copying"));
+    }
+
+    #[test]
     fn help_opens_and_any_key_closes_it() {
         let mut app = with_vms();
         let _ = app.key(press(KeyCode::Char('?')));
-        let text = screen(&mut app, 72, 20);
-        assert!(text.contains("─ keys ─") && text.contains("pause or resume"), "{text}");
+        let text = screen(&mut app, 80, 26);
+        assert!(text.contains("─ keys ─") && text.contains("pause or resume") && text.contains("download it now"), "{text}");
         assert_eq!(app.key(press(KeyCode::Char('q'))), Action::None); // closes help, doesn't quit
         assert!(app.modal.is_none());
         assert_eq!(app.key(press(KeyCode::Char('q'))), Action::Quit);
@@ -908,7 +1566,7 @@ mod tests {
     #[test]
     fn scrollbar_only_when_rows_overflow() {
         let many: Vec<Entry> = (0..12).map(|i| entry(&format!("vm-{i:02}"), State::Stopped, "debian-13", 2222 + i)).collect();
-        let mut app = App::default();
+        let mut app = App::new(&home(), Arch::Aarch64);
         app.update(many[..3].to_vec());
         assert!(!screen(&mut app, 72, 9).contains('┃'));
         app.update(many);
@@ -924,9 +1582,25 @@ mod tests {
     fn long_names_are_clipped() {
         assert_eq!(clip("debian-13", IMAGE_MAX), "debian-13");
         assert_eq!(clip("debian-13-aarch64-d8470b8c6c38", IMAGE_MAX), "debian-13-aarch64…");
-        let mut app = App::default();
-        app.update(vec![entry("dev", State::Running, "debian-13-aarch64-d8470b8c6c38", 2222)]);
-        let text = screen(&mut app, 80, 6);
-        assert!(text.contains("debian-13-aarch64…  aarch64") && text.contains("127.0.0.1:2222"), "{text}");
+    }
+
+    trait CloneForTest {
+        fn clone_for_test(&self) -> Vec<Info>;
+    }
+
+    impl CloneForTest for Vec<Info> {
+        fn clone_for_test(&self) -> Vec<Info> {
+            self.iter()
+                .map(|i| Info {
+                    name: i.name.clone(),
+                    title: i.title.clone(),
+                    size: i.size,
+                    on_disk: i.on_disk,
+                    downloading: i.downloading,
+                    custom: i.custom,
+                    native: i.native,
+                })
+                .collect()
+        }
     }
 }

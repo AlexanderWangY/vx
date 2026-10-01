@@ -9,7 +9,7 @@ use anyhow::Result;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::{cursor, execute, terminal};
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -35,7 +35,7 @@ pub fn interactive() -> bool {
 }
 
 /// What a key press did to a form.
-enum Step<T> {
+pub enum Step<T> {
     Continue,
     Cancel,
     Done(T),
@@ -181,11 +181,13 @@ struct Choice {
     cached: bool,
     /// Whether it's built for the VM's architecture; if not, it runs as the other one, emulated.
     native: bool,
+    /// Added with `vx images add`.
+    custom: bool,
 }
 
-/// The `vx new` form.
-struct NewForm<'a> {
-    home: &'a Home,
+/// The `vx new` form. Also shown inside the dashboard.
+pub struct NewForm {
+    home: Home,
     arch: Arch,
     host_cpus: usize,
     defaults: Spec,
@@ -211,12 +213,11 @@ const MARGIN: &str = "  ";
 /// Returns `None` if cancelled.
 pub fn new_vm(home: &Home, args: NewArgs) -> Result<Option<NewArgs>> {
     let mut form = NewForm::new(home, args)?;
-    let height = FIXED_ROWS + IMAGE_ROWS.min(form.images.len() as u16);
-    run(height, &mut form)
+    run(form.height(), &mut form)
 }
 
-impl<'a> NewForm<'a> {
-    fn new(home: &'a Home, args: NewArgs) -> Result<NewForm<'a>> {
+impl NewForm {
+    pub fn new(home: &Home, args: NewArgs) -> Result<NewForm> {
         let defaults = Spec::defaults()?;
         let arch = args.arch.unwrap_or(defaults.arch);
         let mut images: Vec<Choice> = image::CATALOG
@@ -227,17 +228,27 @@ impl<'a> NewForm<'a> {
                 size: format!("{} MB", i.size_mb),
                 cached: !i.cached(home, arch).is_empty(),
                 native: i.supports(arch),
+                custom: false,
             })
             .collect();
+        images.extend(image::customs(home).into_iter().map(|c| Choice {
+            arg: c.name,
+            title: "added by you".into(),
+            size: bytes(c.size),
+            cached: true,
+            native: true,
+            custom: true,
+        }));
         // `--image ./disk.qcow2` shows up as its own row.
-        if let Source::File(path) = Source::parse(&args.image)? {
+        if let Source::File(path) = Source::parse(home, &args.image)? {
             let size = path.metadata().map(|m| bytes(m.len())).unwrap_or_default();
-            images.insert(0, Choice { arg: args.image.clone(), title: "local file".into(), size, cached: true, native: true });
+            let file = Choice { arg: args.image.clone(), title: "local file".into(), size, cached: true, native: true, custom: false };
+            images.insert(0, file);
         }
         let selected = images.iter().position(|c| c.arg == args.image).unwrap_or(0);
         let name = args.name.unwrap_or_else(|| suggest_name(home));
         Ok(NewForm {
-            home,
+            home: Home::at(home.root()),
             arch,
             host_cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
             no_start: args.no_start,
@@ -290,7 +301,12 @@ impl<'a> NewForm<'a> {
         self.selected = index.min(self.images.len() - 1);
     }
 
-    fn handle(&mut self, key: KeyEvent) -> Step<NewArgs> {
+    /// Rows it needs to show the whole image list.
+    pub fn height(&self) -> u16 {
+        FIXED_ROWS + IMAGE_ROWS.min(self.images.len() as u16)
+    }
+
+    pub fn handle(&mut self, key: KeyEvent) -> Step<NewArgs> {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => return Step::Cancel,
@@ -383,8 +399,7 @@ impl<'a> NewForm<'a> {
         })
     }
 
-    fn render(&mut self, frame: &mut Frame) {
-        let area = frame.area();
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         let rows = area.height.saturating_sub(FIXED_ROWS).max(1) as usize;
         if self.selected < self.scroll {
             self.scroll = self.selected;
@@ -436,6 +451,8 @@ impl<'a> NewForm<'a> {
             };
             let note = if !choice.native {
                 Span::styled(format!("{} only", other(self.arch)), WARN)
+            } else if choice.custom {
+                Span::styled("custom", Style::new().fg(Color::Cyan))
             } else if choice.cached {
                 Span::styled("cached", OK)
             } else {
@@ -524,15 +541,144 @@ impl<'a> NewForm<'a> {
     }
 }
 
-impl Form for NewForm<'_> {
+impl Form for NewForm {
     type Output = NewArgs;
 
     fn draw(&mut self, frame: &mut Frame) {
-        self.render(frame);
+        self.render(frame, frame.area());
     }
 
     fn key(&mut self, key: KeyEvent) -> Step<NewArgs> {
         self.handle(key)
+    }
+}
+
+/// The dashboard's "add image" form: a file and the name to add it under.
+pub struct AddImageForm {
+    home: Home,
+    /// 0: file, 1: name.
+    focus: usize,
+    file: Input,
+    name: Input,
+    /// Until the name is typed in, it follows the file's name.
+    name_edited: bool,
+}
+
+/// What the add-image form produces: the name, and the file's absolute path.
+pub struct NewImage {
+    pub name: String,
+    pub file: String,
+}
+
+impl AddImageForm {
+    pub const HEIGHT: u16 = 6;
+
+    pub fn new(home: &Home) -> AddImageForm {
+        AddImageForm { home: Home::at(home.root()), focus: 0, file: Input::default(), name: Input::default(), name_edited: false }
+    }
+
+    /// The file path, with `~` expanded.
+    fn path(&self) -> std::path::PathBuf {
+        let text = self.file.text.trim();
+        match (text.strip_prefix("~/"), std::env::home_dir()) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => std::path::PathBuf::from(text),
+        }
+    }
+
+    fn problem(&self, field: usize) -> Option<String> {
+        if field == 0 {
+            let path = self.path();
+            return if self.file.text.trim().is_empty() {
+                Some("the path to a qcow2 or raw disk image".into())
+            } else if path.is_dir() {
+                Some("that's a folder; pick a disk image file".into())
+            } else if !path.is_file() {
+                Some("no such file".into())
+            } else {
+                None
+            };
+        }
+        if self.name.text.is_empty() {
+            return Some("give it a name".into());
+        }
+        image::check_custom_name(&self.home, &self.name.text).err().map(|e| e.to_string())
+    }
+
+    /// `~/Downloads/My Image.qcow2` → `my-image`
+    fn name_from_file(&self) -> String {
+        let stem = self.path().file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let name: String = stem
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '.') { c } else { '-' })
+            .collect();
+        name.trim_matches(|c: char| !c.is_ascii_alphanumeric()).chars().take(32).collect()
+    }
+
+    pub fn handle(&mut self, key: KeyEvent) -> Step<NewImage> {
+        match key.code {
+            KeyCode::Esc => return Step::Cancel,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => self.focus = 1 - self.focus,
+            KeyCode::Enter => {
+                if let Some(field) = (0..2).find(|f| self.problem(*f).is_some()) {
+                    self.focus = field;
+                    return Step::Continue;
+                }
+                let file = std::path::absolute(self.path()).unwrap_or_else(|_| self.path());
+                return Step::Done(NewImage { name: self.name.text.clone(), file: file.display().to_string() });
+            }
+            _ if self.focus == 0 => {
+                self.file.edit(key, 4096, |c| (!c.is_control()).then_some(c));
+                if !self.name_edited {
+                    self.name = Input::new(&self.name_from_file());
+                }
+            }
+            _ => {
+                let before = self.name.text.clone();
+                self.name.edit(key, 32, |c| match c {
+                    'a'..='z' | '0'..='9' | '-' | '.' => Some(c),
+                    'A'..='Z' => Some(c.to_ascii_lowercase()),
+                    ' ' | '_' => Some('-'),
+                    _ => None,
+                });
+                self.name_edited |= self.name.text != before;
+            }
+        }
+        Step::Continue
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let mut lines = Vec::new();
+        let mut cursor = None;
+        for (i, (title, input)) in [("File", &self.file), ("Name", &self.name)].into_iter().enumerate() {
+            let label_style = if self.focus == i { ACCENT } else { Style::new() };
+            let mark = if self.problem(i).is_none() { Span::styled(" ✓", OK) } else { Span::raw("") };
+            // Long paths scroll so the cursor stays in view.
+            let room = (area.width as usize).saturating_sub(LABEL + 3).max(1);
+            let skip = input.cursor.saturating_sub(room);
+            let shown: String = input.text.chars().skip(skip).take(room).collect();
+            if self.focus == i {
+                let x = area.x + (LABEL + input.cursor - skip) as u16;
+                cursor = Some(Position::new(x, area.y + lines.len() as u16));
+            }
+            lines.push(Line::from(vec![
+                Span::styled(format!("{title:LABEL$}"), label_style),
+                Span::raw(shown),
+                mark,
+            ]));
+        }
+        lines.push(Line::default());
+        lines.push(match self.problem(self.focus) {
+            Some(problem) if self.focus == 0 && self.file.text.trim().is_empty() => Line::styled(problem, DIM),
+            Some(problem) => Line::styled(problem, ERROR),
+            None if self.focus == 0 => Line::styled("it's copied into vx, so the original can move", DIM),
+            None => Line::styled(format!("use it with `vx new <name> --image {}`", self.name.text), DIM),
+        });
+        lines.push(Line::styled("tab move · enter add · esc cancel", DIM));
+        frame.render_widget(Paragraph::new(lines), area);
+        if let Some(position) = cursor.filter(|p| area.contains(*p)) {
+            frame.set_cursor_position(position);
+        }
     }
 }
 
@@ -736,7 +882,7 @@ mod tests {
         }
     }
 
-    fn form(home: &Home) -> NewForm<'_> {
+    fn form(home: &Home) -> NewForm {
         NewForm::new(home, NewArgs { cpus: Some(4), ..args() }).unwrap()
     }
 

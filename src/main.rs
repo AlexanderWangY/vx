@@ -19,6 +19,7 @@ mod vx;
 
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -80,12 +81,28 @@ enum Command {
         #[arg(short, long)]
         yes: bool,
     },
-    /// List the images `vx new` can use
+    /// List the images `vx new` can use, or manage them
     Images {
-        /// Delete every cached download (VMs keep their own disks)
-        #[arg(long)]
-        prune: bool,
+        #[command(subcommand)]
+        action: Option<ImagesCommand>,
     },
+}
+
+#[derive(Subcommand)]
+enum ImagesCommand {
+    /// Download an image now, so `vx new` doesn't wait for it
+    Pull {
+        image: String,
+        /// Download the build for this architecture instead of the host's
+        #[arg(long)]
+        arch: Option<Arch>,
+    },
+    /// Add a disk image of your own (qcow2 or raw) under a name
+    Add { name: String, file: PathBuf },
+    /// Delete an image's local copy: a cached download, or one you added
+    Rm { image: String },
+    /// Delete every cached download; images you added stay
+    Prune,
 }
 
 #[derive(clap::Args)]
@@ -203,7 +220,8 @@ fn run(cli: Cli) -> Result<()> {
                 rm(vm, yes)?;
             }
         }
-        Command::Images { prune } => images(&home, prune)?,
+        Command::Images { action: None } => images(&home)?,
+        Command::Images { action: Some(action) } => images_command(&home, action)?,
     }
     Ok(())
 }
@@ -353,7 +371,7 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
     let started = Instant::now();
     let name = args.name.clone().unwrap_or_default();
     home.check_new_name(&name)?;
-    let source = Source::parse(&args.image)?;
+    let source = Source::parse(home, &args.image)?;
     let mut spec = Spec::defaults()?;
     spec.image = source.name();
     spec.arch = args.arch.unwrap_or(spec.arch);
@@ -430,36 +448,65 @@ fn boot_timeout(vm: &Vm) -> Duration {
     Duration::from_secs(if native { 180 } else { 900 })
 }
 
-fn images(home: &Home, prune: bool) -> Result<()> {
-    if prune {
-        let freed = image::prune(home)?;
-        println!("{} removed {} of cached images", OUT.green('✓'), progress::bytes(freed));
-        return Ok(());
-    }
+fn images(home: &Home) -> Result<()> {
     let arch = Arch::host()?;
-    let name_w = image::CATALOG.iter().map(|i| i.name.len()).max().unwrap_or(0);
-    let title_w = image::CATALOG.iter().map(|i| i.title.len()).max().unwrap_or(0);
-    let header = format!("{:name_w$}  {:title_w$}  {:>8}  CACHED", "IMAGE", "DESCRIPTION", "DOWNLOAD");
+    let infos = image::infos(home, arch);
+    let name_w = infos.iter().map(|i| i.name.len()).max().unwrap_or(0);
+    let title_w = infos.iter().map(|i| i.title.len()).max().unwrap_or(0);
+    let header = format!("{:name_w$}  {:title_w$}  {:>8}  ON DISK", "IMAGE", "DESCRIPTION", "SIZE");
     println!("{}", OUT.dim(header));
-    for img in image::CATALOG {
-        let cached = if img.cached(home, arch).is_empty() { OUT.dim("-") } else { OUT.green("yes") };
-        let size = format!("~{} MB", img.size_mb);
-        let row = format!("{:name_w$}  {:title_w$}  {size:>8}  {cached:6}", img.name, img.title);
-        if img.name == image::DEFAULT {
-            println!("{row}  {}", OUT.dim("(default)"));
-        } else if !img.supports(arch) {
-            println!("{row}  {}", OUT.yellow("(x86_64 only)"));
+    for info in &infos {
+        let size = if info.custom { progress::bytes(info.size) } else { format!("~{}", progress::bytes(info.size)) };
+        let on_disk = match info.downloading {
+            Some(done) => OUT.cyan(format!("↓ {}", progress::bytes(done))),
+            None if info.on_disk > 0 => OUT.green(progress::bytes(info.on_disk)),
+            None => OUT.dim("-".to_string()),
+        };
+        let row = format!("{:name_w$}  {:title_w$}  {size:>8}  {on_disk:7}", info.name, info.title);
+        if info.name == image::DEFAULT {
+            println!("{row}  {}", OUT.dim("default"));
+        } else if info.custom {
+            println!("{row}  {}", OUT.cyan("custom"));
+        } else if !info.native {
+            let other = if arch == Arch::Aarch64 { Arch::X86_64 } else { Arch::Aarch64 };
+            println!("{row}  {}", OUT.yellow(format!("{other} only")));
         } else {
             println!("{}", row.trim_end());
         }
     }
     println!();
-    println!("{}", OUT.dim("vx new <name> --image <image>   or pass a path to a qcow2 file"));
+    println!("{}", OUT.dim("vx new <name> --image <image> · vx images pull | add | rm | prune"));
     let cache = format!(
-        "cache: {} ({}); `vx images --prune` empties it",
-        home.images().display(),
-        progress::bytes(image::cache_size(home))
+        "downloads: {} in {}",
+        progress::bytes(image::cache_size(home)),
+        home.images().display()
     );
     println!("{}", OUT.dim(cache));
+    Ok(())
+}
+
+fn images_command(home: &Home, action: ImagesCommand) -> Result<()> {
+    match action {
+        ImagesCommand::Pull { image, arch } => {
+            let Some(found) = image::find(&image) else {
+                return Err(hinted(format!("no image called `{image}` to download"), "`vx images` lists them"));
+            };
+            found.fetch(home, arch.map_or_else(Arch::host, Ok)?)?;
+        }
+        ImagesCommand::Add { name, file } => {
+            eprintln!("{}", ERR.dim(format!("copying {}…", file.display())));
+            let path = image::add_custom(home, &name, &file)?;
+            let size = progress::bytes(path.metadata()?.len());
+            println!("{} added {name} {}", OUT.green('✓'), OUT.dim(format!("({size}) · vx new <name> --image {name}")));
+        }
+        ImagesCommand::Rm { image } => {
+            let freed = image::remove(home, &image)?;
+            println!("{} deleted {image} {}", OUT.green('✓'), OUT.dim(format!("({} freed)", progress::bytes(freed))));
+        }
+        ImagesCommand::Prune => {
+            let freed = image::prune(home)?;
+            println!("{} removed {} of downloads", OUT.green('✓'), progress::bytes(freed));
+        }
+    }
     Ok(())
 }

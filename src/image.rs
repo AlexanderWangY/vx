@@ -4,12 +4,14 @@
 //! URL starts serving a new build, it becomes a new file. VMs copy their disk out of the cache,
 //! so deleting it is always safe.
 
-use std::fs::{self, File};
+use std::ffi::OsStr;
+use std::fs::{self, DirBuilder, File};
+use std::os::unix::fs::DirBuilderExt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::Digest as _;
 use sha2::{Sha256, Sha512};
 
@@ -223,17 +225,26 @@ pub const CATALOG: &[Image] = &[
     },
 ];
 
+pub fn find(name: &str) -> Option<&'static Image> {
+    CATALOG.iter().find(|i| i.name == name)
+}
+
 /// What `vx new --image` refers to.
 pub enum Source {
     Catalog(&'static Image),
+    /// One you added with `vx images add`.
+    Custom { name: String, path: PathBuf },
     File(PathBuf),
 }
 
 impl Source {
-    /// A catalog name, or a path to a disk image.
-    pub fn parse(arg: &str) -> Result<Source> {
-        if let Some(image) = CATALOG.iter().find(|i| i.name == arg) {
+    /// A catalog name, the name of an image you added, or a path to a disk image.
+    pub fn parse(home: &Home, arg: &str) -> Result<Source> {
+        if let Some(image) = find(arg) {
             return Ok(Source::Catalog(image));
+        }
+        if let Some(path) = custom(home, arg) {
+            return Ok(Source::Custom { name: arg.into(), path });
         }
         let path = Path::new(arg);
         if path.is_file() {
@@ -248,6 +259,7 @@ impl Source {
     pub fn name(&self) -> String {
         match self {
             Source::Catalog(image) => image.name.into(),
+            Source::Custom { name, .. } => name.clone(),
             Source::File(path) => path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
         }
     }
@@ -255,7 +267,7 @@ impl Source {
     pub fn title(&self) -> String {
         match self {
             Source::Catalog(image) => image.title.into(),
-            Source::File(_) => self.name(),
+            Source::Custom { .. } | Source::File(_) => self.name(),
         }
     }
 
@@ -263,7 +275,7 @@ impl Source {
     pub fn check_arch(&self, arch: Arch) -> Result<()> {
         match self {
             Source::Catalog(image) => image.spelling(arch).map(drop),
-            Source::File(_) => Ok(()),
+            Source::Custom { .. } | Source::File(_) => Ok(()),
         }
     }
 
@@ -271,7 +283,7 @@ impl Source {
     pub fn fetch(&self, home: &Home, arch: Arch) -> Result<PathBuf> {
         match self {
             Source::Catalog(image) => image.fetch(home, arch),
-            Source::File(path) => Ok(path.clone()),
+            Source::Custom { path, .. } | Source::File(path) => Ok(path.clone()),
         }
     }
 }
@@ -392,19 +404,185 @@ fn hrefs(html: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every file in the cache, including interrupted downloads. Returns the bytes freed.
+/// The downloads in the cache, including interrupted ones; images you added aren't included.
+fn downloads(home: &Home) -> Vec<(PathBuf, fs::Metadata)> {
+    fs::read_dir(home.images())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Some((e.path(), e.metadata().ok().filter(|m| m.is_file())?)))
+        .collect()
+}
+
+/// Delete every cached download. Images you added stay. Returns the bytes freed.
 pub fn prune(home: &Home) -> Result<u64> {
     let mut freed = 0;
-    for entry in fs::read_dir(home.images()).into_iter().flatten() {
-        let entry = entry?;
-        freed += entry.metadata()?.len();
-        fs::remove_file(entry.path()).with_context(|| format!("removing {}", entry.path().display()))?;
+    for (path, meta) in downloads(home) {
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        freed += meta.len();
     }
     Ok(freed)
 }
 
 pub fn cache_size(home: &Home) -> u64 {
-    fs::read_dir(home.images()).into_iter().flatten().flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum()
+    downloads(home).iter().map(|(_, m)| m.len()).sum()
+}
+
+/// Images you added, kept apart from downloads so pruning the cache never touches them.
+pub fn custom_dir(home: &Home) -> PathBuf {
+    home.images().join("custom")
+}
+
+fn custom(home: &Home, name: &str) -> Option<PathBuf> {
+    let path = custom_dir(home).join(format!("{name}.img"));
+    path.is_file().then_some(path)
+}
+
+pub struct Custom {
+    pub name: String,
+    pub size: u64,
+}
+
+/// Images you added, sorted by name.
+pub fn customs(home: &Home) -> Vec<Custom> {
+    let mut found: Vec<Custom> = fs::read_dir(custom_dir(home))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.strip_suffix(".img")?.to_string();
+            let meta = e.metadata().ok().filter(|m| m.is_file())?;
+            Some(Custom { name, size: meta.len() })
+        })
+        .collect();
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
+}
+
+/// Why `name` can't be used for a new custom image, if it can't.
+pub fn check_custom_name(home: &Home, name: &str) -> Result<()> {
+    let valid = name.len() <= 32
+        && name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'.'));
+    if !valid {
+        return Err(hinted(
+            format!("`{name}` isn't a valid image name"),
+            "use up to 32 lowercase letters, digits, `-` and `.`, starting with a letter",
+        ));
+    }
+    if find(name).is_some() {
+        return Err(hinted(format!("`{name}` is a built-in image"), "pick another name"));
+    }
+    if custom(home, name).is_some() {
+        return Err(hinted(
+            format!("there's already an image called `{name}`"),
+            format!("pick another name, or delete it with `vx images rm {name}`"),
+        ));
+    }
+    Ok(())
+}
+
+/// Add a disk image of your own (qcow2 or raw) under `name`. It's copied, which is instant
+/// on APFS, btrfs and XFS, so the original can move or go away.
+pub fn add_custom(home: &Home, name: &str, file: &Path) -> Result<PathBuf> {
+    check_custom_name(home, name)?;
+    if !file.is_file() {
+        return Err(hinted(format!("{} isn't a file", file.display()), "pass the path to a qcow2 or raw disk image"));
+    }
+    let dir = custom_dir(home);
+    DirBuilder::new().recursive(true).mode(0o700).create(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let part = dir.join(format!(".{name}.part"));
+    let dest = dir.join(format!("{name}.img"));
+    fs::copy(file, &part).with_context(|| format!("copying {}", file.display()))?;
+    fs::rename(&part, &dest).with_context(|| format!("moving into {}", dest.display()))?;
+    Ok(dest)
+}
+
+/// Delete an image's local copies: every cached download of a catalog image, or an image you
+/// added. Returns the bytes freed.
+pub fn remove(home: &Home, name: &str) -> Result<u64> {
+    if let Some(path) = custom(home, name) {
+        let size = path.metadata()?.len();
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        return Ok(size);
+    }
+    if find(name).is_none() {
+        return Err(hinted(format!("no image called `{name}`"), "`vx images` lists them"));
+    }
+    let mut freed = 0;
+    for (path, meta) in downloads(home) {
+        if is_download_of(name, &path) {
+            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            freed += meta.len();
+        }
+    }
+    if freed == 0 {
+        bail!("{name} isn't downloaded");
+    }
+    Ok(freed)
+}
+
+/// `<name>-<arch>-<hex>.qcow2`, or a `.part` of one.
+fn is_download_of(name: &str, path: &Path) -> bool {
+    let Some(file) = path.file_name().and_then(|f| f.to_str()) else { return false };
+    file.strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|rest| ["aarch64-", "x86_64-"].iter().any(|arch| rest.starts_with(arch)))
+}
+
+/// One image as `vx images` and the dashboard show it.
+pub struct Info {
+    pub name: String,
+    pub title: String,
+    /// Download size for catalog images, file size for ones you added.
+    pub size: u64,
+    /// Bytes of finished downloads for this arch, or the custom image's size.
+    pub on_disk: u64,
+    /// Bytes so far of a download in progress, from any `vx` process.
+    pub downloading: Option<u64>,
+    pub custom: bool,
+    /// Built for the arch asked about.
+    pub native: bool,
+}
+
+/// Every image, catalog first, for `arch`.
+pub fn infos(home: &Home, arch: Arch) -> Vec<Info> {
+    let files = downloads(home);
+    let mut infos: Vec<Info> = CATALOG
+        .iter()
+        .map(|image| {
+            let prefix = format!("{}-{arch}-", image.name);
+            let mine = files.iter().filter(|(p, _)| p.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.starts_with(&prefix)));
+            let on_disk = mine.clone().filter(|(p, _)| p.extension() == Some(OsStr::new("qcow2"))).map(|(_, m)| m.len()).sum();
+            // A .part that stopped growing is a download that was interrupted, not one in progress.
+            let downloading = mine
+                .filter(|(p, m)| {
+                    p.extension() == Some(OsStr::new("part"))
+                        && m.modified().is_ok_and(|t| t.elapsed().unwrap_or_default() < Duration::from_secs(5))
+                })
+                .map(|(_, m)| m.len())
+                .max();
+            Info {
+                name: image.name.into(),
+                title: image.title.into(),
+                size: image.size_mb as u64 * 1_000_000,
+                on_disk,
+                downloading,
+                custom: false,
+                native: image.supports(arch),
+            }
+        })
+        .collect();
+    infos.extend(customs(home).into_iter().map(|c| Info {
+        title: "added by you".into(),
+        size: c.size,
+        on_disk: c.size,
+        downloading: None,
+        custom: true,
+        native: true,
+        name: c.name,
+    }));
+    infos
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -641,6 +819,65 @@ mod tests {
         let mut h = Hasher::new(Alg::Sha256);
         h.update(b"abc");
         assert_eq!(h.hex(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    /// A throwaway $VX_HOME with some fake downloads in it.
+    fn home_with_downloads() -> Home {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let home = Home::at(std::env::temp_dir().join(format!("vx-image-{}-{n}", std::process::id())));
+        home.init().unwrap();
+        for file in ["debian-13-aarch64-aaaaaaaaaaaa.qcow2", "debian-13-x86_64-bbbbbbbbbbbb.qcow2", "debian-12-aarch64-cccccccccccc.qcow2"] {
+            fs::write(home.images().join(file), vec![0; 1000]).unwrap();
+        }
+        home
+    }
+
+    #[test]
+    fn custom_images_are_added_used_and_removed() {
+        let home = home_with_downloads();
+        let file = home.root().join("disk.qcow2");
+        fs::write(&file, vec![1; 500]).unwrap();
+
+        add_custom(&home, "mine", &file).unwrap();
+        assert!(matches!(Source::parse(&home, "mine").unwrap(), Source::Custom { ref name, .. } if name == "mine"));
+        let infos = infos(&home, Arch::Aarch64);
+        let mine = infos.iter().find(|i| i.name == "mine").unwrap();
+        assert!(mine.custom && mine.on_disk == 500);
+        assert_eq!(infos.iter().find(|i| i.name == "debian-13").unwrap().on_disk, 1000, "only this arch's copy");
+
+        // Taken names, built-in names and bad names are refused, each with a hint.
+        for bad in ["mine", "debian-13", "Mine", "1st"] {
+            let e = add_custom(&home, bad, &file).unwrap_err();
+            assert!(e.chain().any(|c| c.downcast_ref::<crate::Hinted>().is_some()), "{bad}: {e}");
+        }
+
+        // Pruning the cache leaves images you added alone.
+        assert_eq!(prune(&home).unwrap(), 3000);
+        assert!(custom(&home, "mine").is_some());
+        assert_eq!(remove(&home, "mine").unwrap(), 500);
+        assert!(custom(&home, "mine").is_none());
+        fs::remove_dir_all(home.root()).unwrap();
+    }
+
+    #[test]
+    fn remove_deletes_only_that_images_downloads() {
+        let home = home_with_downloads();
+        fs::write(home.images().join("debian-13-aarch64-dddddddddddd.part"), vec![0; 10]).unwrap();
+        assert_eq!(remove(&home, "debian-13").unwrap(), 2010);
+        assert_eq!(cache_size(&home), 1000, "debian-12 is untouched");
+        assert!(remove(&home, "debian-13").unwrap_err().to_string().contains("isn't downloaded"));
+        assert!(remove(&home, "nope").is_err());
+        fs::remove_dir_all(home.root()).unwrap();
+    }
+
+    #[test]
+    fn download_names() {
+        let p = |f: &str| PathBuf::from(f);
+        assert!(is_download_of("debian-13", &p("debian-13-aarch64-aaaaaaaaaaaa.qcow2")));
+        assert!(is_download_of("debian-13", &p("debian-13-x86_64-aaaaaaaaaaaa.part")));
+        assert!(!is_download_of("debian-1", &p("debian-13-aarch64-aaaaaaaaaaaa.qcow2")));
+        assert!(!is_download_of("centos-stream-1", &p("centos-stream-10-aarch64-aaaaaaaaaaaa.qcow2")));
     }
 
     /// Hits the network: `cargo test -- --ignored catalog_resolves`. Reads only directory
