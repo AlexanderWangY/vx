@@ -19,7 +19,7 @@ use crate::backend::{self, State};
 use crate::host::Arch;
 use crate::image::{self, Source};
 use crate::progress::bytes;
-use crate::style::OUT;
+use crate::style::{self, OUT};
 use crate::vx::{self, Home, Spec};
 use crate::{NewArgs, hinted};
 
@@ -55,9 +55,7 @@ fn run<F: Form>(height: u16, form: &mut F) -> Result<Option<F::Output>> {
             form.draw(frame);
             // NO_COLOR keeps bold and dim, which carry the focus, but drops colors.
             if !OUT.enabled() {
-                for cell in &mut frame.buffer_mut().content {
-                    cell.set_fg(Color::Reset);
-                }
+                style::strip_colors(frame.buffer_mut());
             }
         })?;
         // Anything but a key press (a resize, a focus change) just redraws.

@@ -100,6 +100,13 @@ impl<T: Display> Display for Paint<T> {
     }
 }
 
+/// Drop foreground colors from a drawn screen, keeping bold and dim, for NO_COLOR.
+pub fn strip_colors(buffer: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buffer.content {
+        cell.set_fg(ratatui::style::Color::Reset);
+    }
+}
+
 /// Cut `line` to `width` visible columns, skipping over escape sequences, so a long line
 /// redrawn with `\r` never wraps and never loses its closing reset.
 pub fn fit(line: &str, width: usize) -> String {

@@ -13,6 +13,7 @@ mod qmp;
 mod seed;
 mod ssh;
 mod style;
+mod tui;
 #[allow(dead_code)]
 mod vx;
 
@@ -52,6 +53,10 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Freeze a running VM in place
+    Pause { name: Option<String> },
+    /// Continue a paused VM
+    Resume { name: Option<String> },
     /// SSH into a VM, starting it first if needed
     Ssh {
         name: Option<String>,
@@ -144,11 +149,11 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let Some(command) = cli.command else {
-        println!("dashboard");
-        return Ok(());
-    };
     let home = Home::from_env()?;
+    let Some(command) = cli.command else {
+        // The dashboard needs a terminal; anywhere else, the plain list.
+        return if form::interactive() { tui::run(&home) } else { ls(&home) };
+    };
     // A missing VM name opens a picker; `None` means it was cancelled.
     let pick = |name, verb, question, prefer| pick(&home, name, verb, question, prefer);
     match command {
@@ -166,6 +171,16 @@ fn run(cli: Cli) -> Result<()> {
         Command::Stop { name, force } => {
             if let Some(vm) = pick(name, "stop", "Which VM do you want to stop?", Some(State::Running))? {
                 stop(&vm, force)?;
+            }
+        }
+        Command::Pause { name } => {
+            if let Some(vm) = pick(name, "pause", "Which VM do you want to pause?", Some(State::Running))? {
+                pause(&vm, false)?;
+            }
+        }
+        Command::Resume { name } => {
+            if let Some(vm) = pick(name, "resume", "Which VM do you want to resume?", Some(State::Paused))? {
+                pause(&vm, true)?;
             }
         }
         Command::Ssh { name, command } => {
@@ -228,14 +243,9 @@ fn ls(home: &Home) -> Result<()> {
     let w = names.iter().map(String::len).max().unwrap_or(0).max("NAME".len());
     let header = format!("{:w$}  {:8}  {:7}  {:>4}  {:>6}  SSH", "NAME", "STATE", "ARCH", "CPUS", "MEMORY");
     println!("{}", OUT.dim(header));
-    for name in names {
-        match home.load(&name) {
-            Ok(vm) => {
-                let s = &vm.spec;
-                let state = match backend::get(&s.backend) {
-                    Ok(b) => b.state(&vm),
-                    Err(_) => State::Other(format!("unknown backend `{}`", s.backend)),
-                };
+    for tui::Entry { name, vm } in tui::entries(home)? {
+        match vm {
+            Ok((s, state)) => {
                 let state = match &state {
                     State::Running => OUT.green(state.to_string()),
                     State::Stopped => OUT.dim(state.to_string()),
@@ -244,7 +254,7 @@ fn ls(home: &Home) -> Result<()> {
                 };
                 println!("{name:w$}  {state:8}  {:7}  {:>4}  {:>6}  127.0.0.1:{}", s.arch, s.cpus, s.memory, s.ssh.port);
             }
-            Err(e) => println!("{name:w$}  {} {e:#}", OUT.red("error:")),
+            Err(e) => println!("{name:w$}  {} {e}", OUT.red("error:")),
         }
     }
     Ok(())
@@ -272,6 +282,28 @@ fn stop(vm: &Vm, force: bool) -> Result<()> {
     }
     backend.stop(vm, force)?;
     println!("{} {} stopped", OUT.green('✓'), vm.name);
+    Ok(())
+}
+
+/// Pause a running VM, or resume a paused one.
+fn pause(vm: &Vm, resume: bool) -> Result<()> {
+    let backend = backend::get(&vm.spec.backend)?;
+    let Some(pause) = backend.pause() else {
+        bail!("the {} backend can't pause VMs", vm.spec.backend);
+    };
+    let _lock = vm.lock()?;
+    match (backend.state(vm), resume) {
+        (State::Running, false) => pause.pause(vm)?,
+        (State::Paused, true) => pause.resume(vm)?,
+        (State::Paused, false) => bail!("{} is already paused", vm.name),
+        (State::Running, true) => bail!("{} isn't paused", vm.name),
+        (State::Stopped, _) => {
+            return Err(hinted(format!("{} isn't running", vm.name), format!("vx start {}", vm.name)));
+        }
+        (State::Other(state), _) => bail!("{} is {state}", vm.name),
+    }
+    let done = if resume { "resumed" } else { "paused" };
+    println!("{} {} {done}", OUT.green('✓'), vm.name);
     Ok(())
 }
 
