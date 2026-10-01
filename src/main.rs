@@ -6,6 +6,8 @@ mod qemu;
 #[allow(dead_code)]
 mod vx;
 
+use std::fmt;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -33,9 +35,31 @@ enum Command {
     Rm { name: String },
 }
 
+/// An error that ends with a `hint:` line telling the user how to fix it.
+#[derive(Debug)]
+pub struct Hinted {
+    msg: String,
+    hint: String,
+}
+
+impl fmt::Display for Hinted {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl std::error::Error for Hinted {}
+
+pub fn hinted(msg: impl Into<String>, hint: impl Into<String>) -> anyhow::Error {
+    Hinted { msg: msg.into(), hint: hint.into() }.into()
+}
+
 fn main() {
     if let Err(e) = run(Cli::parse()) {
         eprintln!("error: {e:#}");
+        if let Some(h) = e.chain().find_map(|c| c.downcast_ref::<Hinted>()) {
+            eprintln!("hint: {}", h.hint);
+        }
         std::process::exit(1);
     }
 }
