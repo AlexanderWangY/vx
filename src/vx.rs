@@ -5,12 +5,13 @@ use std::fs::{self, DirBuilder, File, TryLockError};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::{env, fmt, io};
+use std::{env, io};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::hinted;
+use crate::host::Arch;
 
 const SPEC_FILE: &str = "vx.toml";
 const SPEC_HEADER: &str = "# Written by `vx new`. Edit freely; changes apply on next start.\n";
@@ -305,40 +306,14 @@ impl Spec {
         Ok(())
     }
 
+    /// Extra forwards as (host, guest) ports. Invalid entries are skipped; `validate` rejects them.
+    pub fn forwards(&self) -> impl Iterator<Item = (u16, u16)> {
+        self.forward.iter().filter_map(|f| parse_forward(f).ok())
+    }
+
     /// Every host port this VM claims: SSH plus forwards.
     pub fn host_ports(&self) -> impl Iterator<Item = u16> {
-        let forwards = self.forward.iter().filter_map(|f| parse_forward(f).ok()).map(|(h, _)| h);
-        std::iter::once(self.ssh.port).chain(forwards)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Arch {
-    Aarch64,
-    X86_64,
-}
-
-impl Arch {
-    pub fn host() -> Result<Arch> {
-        match env::consts::ARCH {
-            "aarch64" => Ok(Arch::Aarch64),
-            "x86_64" => Ok(Arch::X86_64),
-            other => bail!("vx doesn't support {other} hosts"),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Arch::Aarch64 => "aarch64",
-            Arch::X86_64 => "x86_64",
-        }
-    }
-}
-
-impl fmt::Display for Arch {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(self.as_str())
+        std::iter::once(self.ssh.port).chain(self.forwards().map(|(h, _)| h))
     }
 }
 

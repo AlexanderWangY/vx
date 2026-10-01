@@ -2,6 +2,8 @@
 #[allow(dead_code)]
 mod backend;
 #[allow(dead_code)]
+mod host;
+#[allow(dead_code)]
 mod qemu;
 #[allow(dead_code)]
 mod vx;
