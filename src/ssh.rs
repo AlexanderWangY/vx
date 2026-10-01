@@ -159,20 +159,44 @@ pub fn wait_cloud_init(config: &Path, vm: &Vm) -> Result<()> {
     let status = spin(child, &mut spinner, || "finishing cloud-init…".into())?;
     spinner.clear();
     match status.code() {
-        Some(0) => Ok(()),
+        Some(0) => return Ok(()),
         // Done, with recoverable errors.
         Some(2) => {
             eprintln!(
                 "  warning: cloud-init finished with warnings; see `vx ssh {} -- cloud-init status --long`",
                 vm.name
             );
-            Ok(())
+            return Ok(());
         }
-        _ => Err(hinted(
-            format!("cloud-init failed in {}", vm.name),
-            format!("vx ssh {} -- sudo cat /var/log/cloud-init-output.log", vm.name),
-        )),
+        _ => {}
     }
+    // Some images (Fedora, for one) try to set the hostname before D-Bus is up. That fails
+    // the whole run, but everything else, including users and keys, is in place.
+    let report = ssh(config, vm)
+        .args(["-o", "BatchMode=yes", "cloud-init", "status", "--format", "json"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("running ssh")?;
+    if only_hostname_failed(&String::from_utf8_lossy(&report.stdout)) {
+        eprintln!("  warning: cloud-init couldn't set the hostname, so it's still the image's default");
+        return Ok(());
+    }
+    Err(hinted(
+        format!("cloud-init failed in {}", vm.name),
+        format!("vx ssh {} -- cloud-init status --long", vm.name),
+    ))
+}
+
+/// Whether `cloud-init status --format json` lists errors, all from the set_hostname module.
+fn only_hostname_failed(json: &str) -> bool {
+    let Ok(status) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    let Some(errors) = status["errors"].as_array() else {
+        return false;
+    };
+    !errors.is_empty() && errors.iter().all(|e| e.as_str().is_some_and(|e| e.starts_with("('set_hostname',")))
 }
 
 /// Animate the spinner until `child` exits.
@@ -203,6 +227,17 @@ fn boot_tail(vm: &Vm, n: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::vx::Spec;
+
+    #[test]
+    fn hostname_only_failures() {
+        let hostname = r#"('set_hostname', SetHostnameError(\"Failed to set the hostname to dev (dev): ...\"))"#;
+        let other = r#"('users_groups', ValueError(\"bad user\"))"#;
+        let status = |errors: &[&str]| serde_json::json!({ "status": "error", "errors": errors }).to_string();
+        assert!(only_hostname_failed(&status(&[hostname, hostname])));
+        assert!(!only_hostname_failed(&status(&[hostname, other])));
+        assert!(!only_hostname_failed(&status(&[])));
+        assert!(!only_hostname_failed("usage: cloud-init status [-h] [-l] [-w]"));
+    }
 
     #[test]
     fn config_pins_the_host_key() {
