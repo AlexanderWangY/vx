@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/vx_logo.png" alt="vx logo" width="180">
+  <img src="assets/vx_logo.png" alt="vx logo" width="128">
 </p>
 
 # vx
