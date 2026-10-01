@@ -1,3 +1,11 @@
+// Not wired into the commands yet.
+#[allow(dead_code)]
+mod backend;
+#[allow(dead_code)]
+mod qemu;
+#[allow(dead_code)]
+mod vx;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
