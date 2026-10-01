@@ -4,6 +4,8 @@
 
 # vx
 
+**V**M Multiple**X**er
+
 After writing one too many bash scripts to manage my QEMU VMs, I vibecoded `vx` to be the zero-config VM management CLI and TUI of your dreams! It has *never* been easier to provision, manage, and ssh into Linux VMs from the terminal.
 
 ```
