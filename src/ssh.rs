@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use crate::backend::{Backend, Check, State};
 use crate::host::{self, Os};
 use crate::progress::{self, Spinner};
+use crate::style::{self, ERR};
 use crate::vx::{Home, Vm};
 use crate::hinted;
 
@@ -119,7 +120,7 @@ pub fn wait_ready(config: &Path, vm: &Vm, backend: &dyn Backend, timeout: Durati
             .stderr(Stdio::null())
             .spawn()
             .context("running ssh")?;
-        if spin(probe, &mut spinner, || format!("booting… {}", last_boot_line(vm)))?.success() {
+        if spin(probe, &mut spinner, "booting…", || last_boot_line(vm))?.success() {
             spinner.clear();
             return Ok(());
         }
@@ -131,7 +132,7 @@ pub fn wait_ready(config: &Path, vm: &Vm, backend: &dyn Backend, timeout: Durati
             spinner.clear();
             eprintln!("  last boot output:");
             for line in boot_tail(vm, 20) {
-                eprintln!("    {line}");
+                eprintln!("    {}", ERR.dim(line));
             }
             return Err(hinted(
                 format!("{} didn't accept SSH logins within {} s", vm.name, timeout.as_secs()),
@@ -140,7 +141,7 @@ pub fn wait_ready(config: &Path, vm: &Vm, backend: &dyn Backend, timeout: Durati
         }
         let pause = Instant::now() + Duration::from_secs(1);
         while Instant::now() < pause {
-            spinner.update(&format!("booting… {}", last_boot_line(vm)));
+            spinner.update("booting…", &last_boot_line(vm));
             thread::sleep(Duration::from_millis(100));
         }
     }
@@ -156,15 +157,15 @@ pub fn wait_cloud_init(config: &Path, vm: &Vm) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .context("running ssh")?;
-    let status = spin(child, &mut spinner, || "finishing cloud-init…".into())?;
+    let status = spin(child, &mut spinner, "finishing cloud-init…", String::new)?;
     spinner.clear();
     match status.code() {
         Some(0) => return Ok(()),
         // Done, with recoverable errors.
         Some(2) => {
-            eprintln!(
-                "  warning: cloud-init finished with warnings; see `vx ssh {} -- cloud-init status --long`",
-                vm.name
+            style::warn(
+                "  ",
+                format!("cloud-init finished with warnings; see `vx ssh {} -- cloud-init status --long`", vm.name),
             );
             return Ok(());
         }
@@ -179,7 +180,7 @@ pub fn wait_cloud_init(config: &Path, vm: &Vm) -> Result<()> {
         .output()
         .context("running ssh")?;
     if only_hostname_failed(&String::from_utf8_lossy(&report.stdout)) {
-        eprintln!("  warning: cloud-init couldn't set the hostname, so it's still the image's default");
+        style::warn("  ", "cloud-init couldn't set the hostname, so it's still the image's default");
         return Ok(());
     }
     Err(hinted(
@@ -200,12 +201,12 @@ fn only_hostname_failed(json: &str) -> bool {
 }
 
 /// Animate the spinner until `child` exits.
-fn spin(mut child: Child, spinner: &mut Spinner, msg: impl Fn() -> String) -> Result<ExitStatus> {
+fn spin(mut child: Child, spinner: &mut Spinner, msg: &str, detail: impl Fn() -> String) -> Result<ExitStatus> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
         }
-        spinner.update(&msg());
+        spinner.update(msg, &detail());
         thread::sleep(Duration::from_millis(100));
     }
 }

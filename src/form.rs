@@ -19,11 +19,12 @@ use crate::backend::{self, State};
 use crate::host::Arch;
 use crate::image::{self, Source};
 use crate::progress::bytes;
+use crate::style::OUT;
 use crate::vx::{self, Home, Spec};
 use crate::{NewArgs, hinted};
 
 const ACCENT: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-const DIM: Style = Style::new().fg(Color::DarkGray);
+const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const ERROR: Style = Style::new().fg(Color::Red);
 const OK: Style = Style::new().fg(Color::Green);
 const WARN: Style = Style::new().fg(Color::Yellow);
@@ -50,7 +51,15 @@ trait Form {
 fn run<F: Form>(height: u16, form: &mut F) -> Result<Option<F::Output>> {
     let mut inline = Inline::open(height)?;
     loop {
-        inline.terminal.draw(|frame| form.draw(frame))?;
+        inline.terminal.draw(|frame| {
+            form.draw(frame);
+            // NO_COLOR keeps bold and dim, which carry the focus, but drops colors.
+            if !OUT.enabled() {
+                for cell in &mut frame.buffer_mut().content {
+                    cell.set_fg(Color::Reset);
+                }
+            }
+        })?;
         // Anything but a key press (a resize, a focus change) just redraws.
         let Event::Key(press) = event::read()? else { continue };
         if press.kind == KeyEventKind::Release {

@@ -16,6 +16,7 @@ use sha2::{Sha256, Sha512};
 use crate::hinted;
 use crate::host::Arch;
 use crate::progress::Bar;
+use crate::style::{self, ERR};
 use crate::vx::Home;
 
 pub const DEFAULT: &str = "debian-13";
@@ -316,7 +317,7 @@ impl Image {
             Err(e) => {
                 // Offline, or the mirror is down: the newest copy we have will do.
                 if let Some(path) = self.cached(home, arch).into_iter().next() {
-                    eprintln!("  warning: couldn't check for a newer {} ({e:#}); using the cached copy", self.name);
+                    style::warn("  ", format!("couldn't check for a newer {} ({e:#}); using the cached copy", self.name));
                     return Ok(path);
                 }
                 return Err(e);
@@ -326,13 +327,13 @@ impl Image {
         let cache = |sum: &Checksum| home.images().join(format!("{}-{arch}-{}.qcow2", self.name, &sum.hex[..12]));
         let path = cache(&sum);
         if path.exists() {
-            eprintln!("  ✓ {} (cached)", self.name);
+            eprintln!("  {} {} {}", ERR.green('✓'), self.name, ERR.dim("(cached)"));
             return Ok(path);
         }
         match download(&url, &path, &sum, self.name) {
             // "latest" can change between fetching the checksum and the image; try once more.
             Err(e) if e.is::<Mismatch>() => {
-                eprintln!("  {e}; retrying");
+                style::warn("  ", format!("{e}; retrying"));
                 let (url, sum) = self.resolve(spelling)?;
                 let path = cache(&sum);
                 download(&url, &path, &sum, self.name)?;

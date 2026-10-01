@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::backend::{Backend, Check, CommandLine, Console, Pause, State};
 use crate::host::{self, Arch, Os};
+use crate::style::{self, ERR};
 use crate::vx::Vm;
 use crate::{hinted, qmp};
 use probe::Host;
@@ -44,10 +45,16 @@ impl Backend for Qemu {
         let host = Host::probe(vm.spec.arch)?;
         match (&host.accel, vm.spec.arch == host.arch) {
             (Ok(_), true) => {}
-            (Err(why), true) => eprintln!("warning: {why}\nwarning: {} will run emulated, which is much slower", vm.name),
-            (_, false) => eprintln!(
-                "warning: {} is an {} VM on an {} host, so it will run emulated, which is much slower",
-                vm.name, vm.spec.arch, host.arch
+            (Err(why), true) => {
+                style::warn("", why);
+                style::warn("", format!("{} will run emulated, which is much slower", vm.name));
+            }
+            (_, false) => style::warn(
+                "",
+                format!(
+                    "{} is an {} VM on an {} host, so it will run emulated, which is much slower",
+                    vm.name, vm.spec.arch, host.arch
+                ),
             ),
         }
 
@@ -77,11 +84,11 @@ impl Backend for Qemu {
         // A paused guest can't react to the power button, so it goes straight to `quit`.
         if !force && self.state(vm) == State::Running {
             qmp::call(&sock, "system_powerdown")?;
-            eprintln!("waiting for {} to shut down…", vm.name);
+            eprintln!("{}", ERR.dim(format!("waiting for {} to shut down…", vm.name)));
             if self.wait_until_stopped(vm, POWERDOWN_TIMEOUT) {
                 return Ok(());
             }
-            eprintln!("{} ignored the shutdown request; forcing it off", vm.name);
+            style::warn("", format!("{} ignored the shutdown request; forcing it off", vm.name));
         }
 
         let _ = qmp::call(&sock, "quit"); // QEMU may exit before it replies

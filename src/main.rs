@@ -12,6 +12,7 @@ mod qemu;
 mod qmp;
 mod seed;
 mod ssh;
+mod style;
 #[allow(dead_code)]
 mod vx;
 
@@ -25,6 +26,7 @@ use clap::{Parser, Subcommand};
 use backend::State;
 use host::Arch;
 use image::Source;
+use style::{ERR, Label, OUT};
 use vx::{Home, Spec, Vm};
 
 /// Zero-config Linux VMs from the terminal.
@@ -133,9 +135,9 @@ pub fn hinted(msg: impl Into<String>, hint: impl Into<String>) -> anyhow::Error 
 
 fn main() {
     if let Err(e) = run(Cli::parse()) {
-        eprintln!("error: {e:#}");
+        eprintln!("{} {e:#}", ERR.label(Label::Error, "error:"));
         if let Some(h) = e.chain().find_map(|c| c.downcast_ref::<Hinted>()) {
-            eprintln!("hint: {}", h.hint);
+            eprintln!("{} {}", ERR.label(Label::Hint, "hint:"), h.hint);
         }
         std::process::exit(1);
     }
@@ -213,7 +215,7 @@ fn new_args(home: &Home, args: NewArgs) -> Result<Option<NewArgs>> {
         return Err(hinted("vx new needs a name here", "vx new <name>; the form only opens in a terminal"));
     }
     let Some(args) = form::new_vm(home, args)? else { return Ok(None) };
-    eprintln!("  {}", form::command_line(&args)?);
+    eprintln!("  {}", ERR.dim(form::command_line(&args)?));
     Ok(Some(args))
 }
 
@@ -224,18 +226,25 @@ fn ls(home: &Home) -> Result<()> {
         return Ok(());
     }
     let w = names.iter().map(String::len).max().unwrap_or(0).max("NAME".len());
-    println!("{:w$}  {:8}  {:7}  {:>4}  {:>6}  SSH", "NAME", "STATE", "ARCH", "CPUS", "MEMORY");
+    let header = format!("{:w$}  {:8}  {:7}  {:>4}  {:>6}  SSH", "NAME", "STATE", "ARCH", "CPUS", "MEMORY");
+    println!("{}", OUT.dim(header));
     for name in names {
         match home.load(&name) {
             Ok(vm) => {
                 let s = &vm.spec;
                 let state = match backend::get(&s.backend) {
-                    Ok(b) => b.state(&vm).to_string(),
-                    Err(_) => format!("unknown backend `{}`", s.backend),
+                    Ok(b) => b.state(&vm),
+                    Err(_) => State::Other(format!("unknown backend `{}`", s.backend)),
+                };
+                let state = match &state {
+                    State::Running => OUT.green(state.to_string()),
+                    State::Stopped => OUT.dim(state.to_string()),
+                    // Paused, or something QEMU reported that needs a look (e.g. io-error).
+                    _ => OUT.yellow(state.to_string()),
                 };
                 println!("{name:w$}  {state:8}  {:7}  {:>4}  {:>6}  127.0.0.1:{}", s.arch, s.cpus, s.memory, s.ssh.port);
             }
-            Err(e) => println!("{name:w$}  error: {e:#}"),
+            Err(e) => println!("{name:w$}  {} {e:#}", OUT.red("error:")),
         }
     }
     Ok(())
@@ -249,7 +258,8 @@ fn start(vm: &Vm) -> Result<()> {
         state => bail!("{} is already {state}", vm.name),
     }
     backend.start(vm)?;
-    println!("{} started; watch it boot with `vx console {0}` or `vx logs -f {0}`", vm.name);
+    let tip = format!("· watch it boot with `vx console {0}` or `vx logs -f {0}`", vm.name);
+    println!("{} {} started {}", OUT.green('✓'), vm.name, OUT.dim(tip));
     Ok(())
 }
 
@@ -257,11 +267,11 @@ fn stop(vm: &Vm, force: bool) -> Result<()> {
     let backend = backend::get(&vm.spec.backend)?;
     let _lock = vm.lock()?;
     if backend.state(vm) == State::Stopped {
-        println!("{} is already stopped", vm.name);
+        println!("{}", OUT.dim(format!("{} is already stopped", vm.name)));
         return Ok(());
     }
     backend.stop(vm, force)?;
-    println!("{} stopped", vm.name);
+    println!("{} {} stopped", OUT.green('✓'), vm.name);
     Ok(())
 }
 
@@ -278,7 +288,7 @@ fn rm(vm: Vm, yes: bool) -> Result<()> {
     }
     let name = vm.name.clone();
     vm.delete()?;
-    println!("{name} deleted; cached images are kept");
+    println!("{} {name} deleted {}", OUT.green('✓'), OUT.dim("· cached images are kept"));
     Ok(())
 }
 
@@ -289,7 +299,7 @@ fn confirm(vm: &Vm) -> Result<bool> {
             format!("vx rm -y {}", vm.name),
         ));
     }
-    eprint!("delete {} and its disk? [y/N] ", vm.name);
+    eprint!("delete {} and its disk? {} ", ERR.bold(&vm.name), ERR.dim("[y/N]"));
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -326,9 +336,10 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
         return Err(hinted(format!("{} not found", c.name), c.hint.unwrap_or_default()));
     }
 
+    let dot = ERR.dim(" · ");
     eprintln!(
-        "  {} · {} · {} CPUs · {} RAM · {} disk",
-        source.title(),
+        "  {}{dot}{}{dot}{} CPUs{dot}{} RAM{dot}{} disk",
+        ERR.bold(source.title()),
         spec.arch,
         spec.cpus,
         spec.memory,
@@ -343,10 +354,12 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
         seed::write(vm, &client_key, &host_key)
     })?;
     let config = ssh::write_config(home, &vm, backend.ssh_addr(&vm))?;
-    eprintln!("  ✓ disk  ✓ keys  ✓ cloud-init  ✓ ssh port {}", vm.spec.ssh.port);
+    let check = ERR.green('✓');
+    eprintln!("  {check} disk  {check} keys  {check} cloud-init  {check} ssh port {}", vm.spec.ssh.port);
 
     if args.no_start {
-        eprintln!("  ✓ {} created; start it with `vx start {0}`", vm.name);
+        let tip = format!("· start it with `vx start {}`", vm.name);
+        eprintln!("  {check} {} created {}", ERR.bold(&vm.name), ERR.dim(tip));
         return Ok(());
     }
     {
@@ -355,10 +368,13 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
     }
     ssh::wait_ready(&config, &vm, backend, boot_timeout(&vm))?;
     ssh::wait_cloud_init(&config, &vm)?;
+    let took = format!("({} s)", started.elapsed().as_secs());
+    let dot = ERR.dim("  ·  ");
+    let name = &vm.name;
     eprintln!(
-        "  ✓ {} is ready ({} s)    vx ssh {0}  ·  vx console {0}  ·  vx stop {0}",
-        vm.name,
-        started.elapsed().as_secs()
+        "  {check} {} is ready {}    vx ssh {name}{dot}vx console {name}{dot}vx stop {name}",
+        ERR.bold(name),
+        ERR.dim(took)
     );
     Ok(())
 }
@@ -385,32 +401,33 @@ fn boot_timeout(vm: &Vm) -> Duration {
 fn images(home: &Home, prune: bool) -> Result<()> {
     if prune {
         let freed = image::prune(home)?;
-        println!("removed {} of cached images", progress::bytes(freed));
+        println!("{} removed {} of cached images", OUT.green('✓'), progress::bytes(freed));
         return Ok(());
     }
     let arch = Arch::host()?;
     let name_w = image::CATALOG.iter().map(|i| i.name.len()).max().unwrap_or(0);
     let title_w = image::CATALOG.iter().map(|i| i.title.len()).max().unwrap_or(0);
-    println!("{:name_w$}  {:title_w$}  {:>8}  CACHED", "IMAGE", "DESCRIPTION", "DOWNLOAD");
+    let header = format!("{:name_w$}  {:title_w$}  {:>8}  CACHED", "IMAGE", "DESCRIPTION", "DOWNLOAD");
+    println!("{}", OUT.dim(header));
     for img in image::CATALOG {
-        let cached = if img.cached(home, arch).is_empty() { "-" } else { "yes" };
-        let note = if img.name == image::DEFAULT {
-            "(default)".to_string()
-        } else if !img.supports(arch) {
-            "(x86_64 only)".to_string()
-        } else {
-            String::new()
-        };
+        let cached = if img.cached(home, arch).is_empty() { OUT.dim("-") } else { OUT.green("yes") };
         let size = format!("~{} MB", img.size_mb);
-        let row = format!("{:name_w$}  {:title_w$}  {size:>8}  {cached:6}  {note}", img.name, img.title);
-        println!("{}", row.trim_end());
+        let row = format!("{:name_w$}  {:title_w$}  {size:>8}  {cached:6}", img.name, img.title);
+        if img.name == image::DEFAULT {
+            println!("{row}  {}", OUT.dim("(default)"));
+        } else if !img.supports(arch) {
+            println!("{row}  {}", OUT.yellow("(x86_64 only)"));
+        } else {
+            println!("{}", row.trim_end());
+        }
     }
     println!();
-    println!("vx new <name> --image <image>   or pass a path to a qcow2 file");
-    println!(
+    println!("{}", OUT.dim("vx new <name> --image <image>   or pass a path to a qcow2 file"));
+    let cache = format!(
         "cache: {} ({}); `vx images --prune` empties it",
         home.images().display(),
         progress::bytes(image::cache_size(home))
     );
+    println!("{}", OUT.dim(cache));
     Ok(())
 }

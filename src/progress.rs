@@ -4,6 +4,8 @@
 use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
+use crate::style::{self, ERR};
+
 const REDRAW: Duration = Duration::from_millis(100);
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -52,32 +54,37 @@ impl Bar {
     fn line(&self, finished: bool) -> String {
         let elapsed = self.start.elapsed();
         let rate = bytes((self.done as f64 / elapsed.as_secs_f64().max(0.001)) as u64) + "/s";
-        let icon = if finished { '✓' } else { '↓' };
-        let head = format!("  {icon} {}", self.label);
+        let head = if finished {
+            format!("  {} {}", ERR.green('✓'), self.label)
+        } else {
+            format!("  {} {}", ERR.cyan('↓'), self.label)
+        };
         let Some(total) = self.total else {
-            return format!("{head}  {}  {rate}", bytes(self.done));
+            return format!("{head}  {}  {}", bytes(self.done), ERR.dim(rate));
         };
         let frac = (self.done as f64 / total.max(1) as f64).min(1.0);
         let bar = meter(frac, self.width);
         let pct = (frac * 100.0) as u32;
         if finished {
-            return format!("{head}  {bar} {pct:>3}%  {} in {}", bytes(self.done), clock(elapsed));
+            let took = format!("{} in {}", bytes(self.done), clock(elapsed));
+            return format!("{head}  {bar} {pct:>3}%  {}", ERR.dim(took));
         }
         let speed = self.done as f64 / elapsed.as_secs_f64().max(0.001);
         let eta = total.saturating_sub(self.done) as f64 / speed.max(1.0);
         // Unknown until data flows; capped so it never outgrows its column.
         let eta = if self.done == 0 || eta >= 6000.0 { "--:--".into() } else { clock(Duration::from_secs_f64(eta)) };
         let amount = format!("{}/{}", bytes(self.done), bytes(total));
-        format!("{head}  {bar} {pct:>3}%  {amount:>15}  {rate:>8}  {eta:>5}")
+        format!("{head}  {bar} {pct:>3}%  {amount:>15}  {}", ERR.dim(format!("{rate:>8}  {eta:>5}")))
     }
 }
 
+/// The filled part in cyan on a dim track.
 fn meter(frac: f64, width: usize) -> String {
     let full = (frac * width as f64).round() as usize;
-    format!("{}{}", "█".repeat(full), "░".repeat(width - full))
+    format!("{}{}", ERR.cyan("█".repeat(full)), ERR.dim("░".repeat(width - full)))
 }
 
-/// `  ⠋ booting… [  OK  ] Reached target cloud-init.target`
+/// `  ⠋ booting… [  OK  ] Reached target cloud-init.target`, with the detail dimmed.
 pub struct Spinner {
     frame: usize,
     tty: bool,
@@ -88,10 +95,11 @@ impl Spinner {
         Spinner { frame: 0, tty: io::stderr().is_terminal() }
     }
 
-    pub fn update(&mut self, msg: &str) {
+    pub fn update(&mut self, msg: &str, detail: &str) {
         if self.tty {
             self.frame += 1;
-            redraw(&format!("  {} {msg}", SPINNER[self.frame % SPINNER.len()]));
+            let frame = SPINNER[self.frame % SPINNER.len()];
+            redraw(&format!("  {} {msg} {}", ERR.cyan(frame), ERR.dim(detail)));
         }
     }
 
@@ -105,8 +113,7 @@ impl Spinner {
 }
 
 fn redraw(line: &str) {
-    let line: String = line.chars().take(term_width()).collect();
-    eprint!("\r\x1b[2K{line}");
+    eprint!("\r\x1b[2K{}", style::fit(line, term_width()));
     let _ = io::stderr().flush();
 }
 

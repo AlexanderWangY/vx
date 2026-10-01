@@ -10,6 +10,7 @@ use std::{process, thread};
 use anyhow::{Context, Result, ensure};
 
 use crate::hinted;
+use crate::style::ERR;
 use crate::vx::Vm;
 
 /// Ctrl-]
@@ -18,7 +19,7 @@ const DETACH: u8 = 0x1d;
 /// Pass the terminal through to the guest's serial port until Ctrl-] or the VM goes away.
 pub fn attach(name: &str, serial: UnixStream) -> Result<()> {
     ensure!(io::stdin().is_terminal(), "the console needs a terminal");
-    eprintln!("connected to {name}; press Enter for a prompt and Ctrl-] to detach");
+    eprintln!("{}", ERR.dim(format!("connected to {name}; press Enter for a prompt and Ctrl-] to detach")));
     let raw = RawMode::enable()?;
 
     let mut from_guest = serial.try_clone()?;
@@ -33,7 +34,7 @@ pub fn attach(name: &str, serial: UnixStream) -> Result<()> {
             }
         }
         restore(&saved);
-        eprintln!("\n{who} disconnected");
+        eprintln!("\n{}", ERR.dim(format!("{who} disconnected")));
         process::exit(0);
     });
 
@@ -55,7 +56,7 @@ pub fn attach(name: &str, serial: UnixStream) -> Result<()> {
         }
     };
     drop(raw);
-    eprintln!("\ndetached from {name}");
+    eprintln!("\n{}", ERR.dim(format!("detached from {name}")));
     Ok(result?)
 }
 
