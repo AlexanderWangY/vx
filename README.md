@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/vx_logo.png" alt="vx logo" width="180">
+</p>
+
 # vx
 
 A small, zero-config tool for running Linux VMs from the terminal, written in Rust.
