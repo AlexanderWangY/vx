@@ -20,43 +20,205 @@ use crate::vx::Home;
 
 pub const DEFAULT: &str = "debian-13";
 
-/// A cloud image published at a stable URL, next to a checksum file.
+/// A cloud image published next to a checksum file.
 pub struct Image {
     pub name: &'static str,
     pub title: &'static str,
     /// Approximate download size, for display.
     pub size_mb: u32,
-    /// The directory holding the image and its checksum file.
+    /// Where the image and its checksum file live.
     dir: &'static str,
-    /// The image's file name; `{arch}` becomes amd64 or arm64.
+    /// The image's file name. A `*` stands for a version, looked up in the checksum file.
     file: &'static str,
+    /// The checksum file's name. A `*` stands for a version, looked up in the directory listing.
     sums: &'static str,
+    /// How the publisher spells each architecture; `None` if it doesn't build for it.
+    aarch64: Option<Spelling>,
+    x86_64: Option<Spelling>,
 }
+
+/// Fills `{arch}` and `{sub}` in an image's URLs.
+#[derive(Clone, Copy)]
+struct Spelling {
+    arch: &'static str,
+    /// A path segment some publishers add per architecture.
+    sub: &'static str,
+}
+
+const fn spell(arch: &'static str) -> Option<Spelling> {
+    Some(Spelling { arch, sub: "" })
+}
+
+const fn spell_sub(arch: &'static str, sub: &'static str) -> Option<Spelling> {
+    Some(Spelling { arch, sub })
+}
+
+/// Debian and Ubuntu spell architectures the dpkg way.
+const ARM64: Option<Spelling> = spell("arm64");
+const AMD64: Option<Spelling> = spell("amd64");
+const AARCH64: Option<Spelling> = spell("aarch64");
+const X86_64: Option<Spelling> = spell("x86_64");
 
 pub const CATALOG: &[Image] = &[
     Image {
         name: "debian-13",
         title: "Debian 13 (trixie)",
-        size_mb: 325,
+        size_mb: 337,
         dir: "https://cloud.debian.org/images/cloud/trixie/latest/",
         file: "debian-13-genericcloud-{arch}.qcow2",
         sums: "SHA512SUMS",
+        aarch64: ARM64,
+        x86_64: AMD64,
     },
     Image {
-        name: "ubuntu-24.04",
-        title: "Ubuntu 24.04 LTS",
-        size_mb: 595,
-        dir: "https://cloud-images.ubuntu.com/releases/noble/release/",
-        file: "ubuntu-24.04-server-cloudimg-{arch}.img",
-        sums: "SHA256SUMS",
+        name: "debian-12",
+        title: "Debian 12 (bookworm)",
+        size_mb: 340,
+        dir: "https://cloud.debian.org/images/cloud/bookworm/latest/",
+        file: "debian-12-genericcloud-{arch}.qcow2",
+        sums: "SHA512SUMS",
+        aarch64: ARM64,
+        x86_64: AMD64,
     },
     Image {
         name: "ubuntu-26.04",
         title: "Ubuntu 26.04 LTS",
-        size_mb: 850,
+        size_mb: 945,
         dir: "https://cloud-images.ubuntu.com/releases/resolute/release/",
         file: "ubuntu-26.04-server-cloudimg-{arch}.img",
         sums: "SHA256SUMS",
+        aarch64: ARM64,
+        x86_64: AMD64,
+    },
+    Image {
+        name: "ubuntu-24.04",
+        title: "Ubuntu 24.04 LTS",
+        size_mb: 620,
+        dir: "https://cloud-images.ubuntu.com/releases/noble/release/",
+        file: "ubuntu-24.04-server-cloudimg-{arch}.img",
+        sums: "SHA256SUMS",
+        aarch64: ARM64,
+        x86_64: AMD64,
+    },
+    Image {
+        name: "ubuntu-22.04",
+        title: "Ubuntu 22.04 LTS",
+        size_mb: 705,
+        dir: "https://cloud-images.ubuntu.com/releases/jammy/release/",
+        file: "ubuntu-22.04-server-cloudimg-{arch}.img",
+        sums: "SHA256SUMS",
+        aarch64: ARM64,
+        x86_64: AMD64,
+    },
+    Image {
+        name: "fedora-44",
+        title: "Fedora 44 Cloud",
+        size_mb: 528,
+        dir: "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/{arch}/images/",
+        file: "Fedora-Cloud-Base-Generic-44-*.{arch}.qcow2",
+        sums: "Fedora-Cloud-44-*-{arch}-CHECKSUM",
+        aarch64: AARCH64,
+        x86_64: X86_64,
+    },
+    Image {
+        name: "centos-stream-10",
+        title: "CentOS Stream 10",
+        size_mb: 884,
+        dir: "https://cloud.centos.org/centos/10-stream/{arch}/images/",
+        file: "CentOS-Stream-GenericCloud-10-latest.{arch}.qcow2",
+        sums: "CentOS-Stream-GenericCloud-10-latest.{arch}.qcow2.SHA256SUM",
+        aarch64: AARCH64,
+        x86_64: X86_64,
+    },
+    Image {
+        name: "centos-stream-9",
+        title: "CentOS Stream 9",
+        size_mb: 1190,
+        dir: "https://cloud.centos.org/centos/9-stream/{arch}/images/",
+        file: "CentOS-Stream-GenericCloud-9-latest.{arch}.qcow2",
+        sums: "CentOS-Stream-GenericCloud-9-latest.{arch}.qcow2.SHA256SUM",
+        aarch64: AARCH64,
+        x86_64: X86_64,
+    },
+    Image {
+        name: "rocky-10",
+        title: "Rocky Linux 10",
+        size_mb: 469,
+        dir: "https://dl.rockylinux.org/pub/rocky/10/images/{arch}/",
+        file: "Rocky-10-GenericCloud-Base.latest.{arch}.qcow2",
+        sums: "Rocky-10-GenericCloud-Base.latest.{arch}.qcow2.CHECKSUM",
+        aarch64: AARCH64,
+        x86_64: X86_64,
+    },
+    Image {
+        name: "rocky-9",
+        title: "Rocky Linux 9",
+        size_mb: 519,
+        dir: "https://dl.rockylinux.org/pub/rocky/9/images/{arch}/",
+        file: "Rocky-9-GenericCloud-Base.latest.{arch}.qcow2",
+        sums: "Rocky-9-GenericCloud-Base.latest.{arch}.qcow2.CHECKSUM",
+        aarch64: AARCH64,
+        x86_64: X86_64,
+    },
+    Image {
+        name: "almalinux-10",
+        title: "AlmaLinux 10",
+        size_mb: 442,
+        dir: "https://repo.almalinux.org/almalinux/10/cloud/{arch}/images/",
+        file: "AlmaLinux-10-GenericCloud-latest.{arch}.qcow2",
+        sums: "CHECKSUM",
+        aarch64: AARCH64,
+        x86_64: X86_64,
+    },
+    Image {
+        name: "almalinux-9",
+        title: "AlmaLinux 9",
+        size_mb: 451,
+        dir: "https://repo.almalinux.org/almalinux/9/cloud/{arch}/images/",
+        file: "AlmaLinux-9-GenericCloud-latest.{arch}.qcow2",
+        sums: "CHECKSUM",
+        aarch64: AARCH64,
+        x86_64: X86_64,
+    },
+    Image {
+        name: "opensuse-leap-16.0",
+        title: "openSUSE Leap 16.0",
+        size_mb: 318,
+        dir: "https://download.opensuse.org/distribution/leap/16.0/appliances/",
+        file: "Leap-16.0-Minimal-VM.{arch}-Cloud.qcow2",
+        sums: "Leap-16.0-Minimal-VM.{arch}-Cloud.qcow2.sha256",
+        aarch64: AARCH64,
+        x86_64: X86_64,
+    },
+    Image {
+        name: "opensuse-tumbleweed",
+        title: "openSUSE Tumbleweed",
+        size_mb: 291,
+        dir: "https://download.opensuse.org/{sub}tumbleweed/appliances/",
+        file: "openSUSE-Tumbleweed-Minimal-VM.{arch}-Cloud.qcow2",
+        sums: "openSUSE-Tumbleweed-Minimal-VM.{arch}-Cloud.qcow2.sha256",
+        aarch64: spell_sub("aarch64", "ports/aarch64/"),
+        x86_64: X86_64,
+    },
+    Image {
+        name: "archlinux",
+        title: "Arch Linux",
+        size_mb: 578,
+        dir: "https://geo.mirror.pkgbuild.com/images/latest/",
+        file: "Arch-Linux-{arch}-cloudimg.qcow2",
+        sums: "Arch-Linux-{arch}-cloudimg.qcow2.SHA256",
+        aarch64: None,
+        x86_64: X86_64,
+    },
+    Image {
+        name: "amazonlinux-2023",
+        title: "Amazon Linux 2023",
+        size_mb: 2068,
+        dir: "https://cdn.amazonlinux.com/al2023/os-images/latest/{sub}/",
+        file: "al2023-kvm-*-{arch}.xfs.gpt.qcow2",
+        sums: "SHA256SUMS",
+        aarch64: spell_sub("arm64", "kvm-arm64"),
+        x86_64: spell_sub("x86_64", "kvm"),
     },
 ];
 
@@ -96,6 +258,14 @@ impl Source {
         }
     }
 
+    /// Fail early if the image isn't built for `arch`.
+    pub fn check_arch(&self, arch: Arch) -> Result<()> {
+        match self {
+            Source::Catalog(image) => image.spelling(arch).map(drop),
+            Source::File(_) => Ok(()),
+        }
+    }
+
     /// A local copy of the image: the file itself, or a verified download.
     pub fn fetch(&self, home: &Home, arch: Arch) -> Result<PathBuf> {
         match self {
@@ -106,12 +276,21 @@ impl Source {
 }
 
 impl Image {
-    fn file(&self, arch: Arch) -> String {
-        let arch = match arch {
-            Arch::Aarch64 => "arm64",
-            Arch::X86_64 => "amd64",
+    pub fn supports(&self, arch: Arch) -> bool {
+        self.spelling(arch).is_ok()
+    }
+
+    fn spelling(&self, arch: Arch) -> Result<Spelling> {
+        let (spelling, other) = match arch {
+            Arch::Aarch64 => (self.aarch64, Arch::X86_64),
+            Arch::X86_64 => (self.x86_64, Arch::Aarch64),
         };
-        self.file.replace("{arch}", arch)
+        spelling.ok_or_else(|| {
+            hinted(
+                format!("{} has no {arch} build", self.name),
+                format!("add `--arch {other}` to run it emulated, which is much slower"),
+            )
+        })
     }
 
     /// Cached copies for `arch`, newest first.
@@ -130,10 +309,10 @@ impl Image {
 
     /// The current build of this image, from the cache or freshly downloaded and verified.
     pub fn fetch(&self, home: &Home, arch: Arch) -> Result<PathBuf> {
+        let spelling = self.spelling(arch)?;
         home.init()?;
-        let file = self.file(arch);
-        let sum = match self.checksum(&file) {
-            Ok(sum) => sum,
+        let (url, sum) = match self.resolve(spelling) {
+            Ok(found) => found,
             Err(e) => {
                 // Offline, or the mirror is down: the newest copy we have will do.
                 if let Some(path) = self.cached(home, arch).into_iter().next() {
@@ -144,18 +323,18 @@ impl Image {
             }
         };
 
-        let path = home.images().join(format!("{}-{arch}-{}.qcow2", self.name, &sum.hex[..12]));
+        let cache = |sum: &Checksum| home.images().join(format!("{}-{arch}-{}.qcow2", self.name, &sum.hex[..12]));
+        let path = cache(&sum);
         if path.exists() {
             eprintln!("  ✓ {} (cached)", self.name);
             return Ok(path);
         }
-        let url = format!("{}{file}", self.dir);
         match download(&url, &path, &sum, self.name) {
             // "latest" can change between fetching the checksum and the image; try once more.
             Err(e) if e.is::<Mismatch>() => {
                 eprintln!("  {e}; retrying");
-                let sum = self.checksum(&file)?;
-                let path = home.images().join(format!("{}-{arch}-{}.qcow2", self.name, &sum.hex[..12]));
+                let (url, sum) = self.resolve(spelling)?;
+                let path = cache(&sum);
                 download(&url, &path, &sum, self.name)?;
                 Ok(path)
             }
@@ -164,15 +343,52 @@ impl Image {
         }
     }
 
-    fn checksum(&self, file: &str) -> Result<Checksum> {
-        let url = format!("{}{}", self.dir, self.sums);
-        let text = agent()
-            .get(&url)
-            .call()
-            .and_then(|mut r| r.body_mut().read_to_string())
-            .map_err(|e| network_error(e, &url))?;
-        parse_sums(&text, file).with_context(|| format!("{url} has no checksum for {file}"))
+    /// The image's URL and its published checksum, looking up versions where the name has one.
+    fn resolve(&self, spelling: Spelling) -> Result<(String, Checksum)> {
+        let fill = |s: &str| s.replace("{arch}", spelling.arch).replace("{sub}", spelling.sub);
+        let dir = fill(self.dir);
+
+        let mut sums = fill(self.sums);
+        if sums.contains('*') {
+            let listing = get_text(&dir)?;
+            sums = newest(hrefs(&listing), &sums).with_context(|| format!("{dir} has no {sums}"))?;
+        }
+        let sums_url = format!("{dir}{sums}");
+        let file = fill(self.file);
+        let (name, sum) = newest_sum(&get_text(&sums_url)?, &file)
+            .with_context(|| format!("{sums_url} has no checksum for {file}"))?;
+        Ok((format!("{dir}{name}"), sum))
     }
+}
+
+fn get_text(url: &str) -> Result<String> {
+    agent().get(url).call().and_then(|mut r| r.body_mut().read_to_string()).map_err(|e| network_error(e, url))
+}
+
+/// Does `name` match `pattern`, where a single `*` matches anything?
+fn glob(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == name,
+        Some((prefix, suffix)) => {
+            name.len() >= prefix.len() + suffix.len() && name.starts_with(prefix) && name.ends_with(suffix)
+        }
+    }
+}
+
+/// The last name matching `pattern`, in sort order.
+fn newest(names: impl IntoIterator<Item = String>, pattern: &str) -> Option<String> {
+    names.into_iter().filter(|n| glob(pattern, n)).max()
+}
+
+/// File names linked from an HTML directory listing.
+fn hrefs(html: &str) -> Vec<String> {
+    html.split("href=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .map(|link| link.split(['?', '#']).next().unwrap_or_default())
+        .filter(|link| !link.is_empty() && !link.ends_with('/'))
+        .map(|link| link.rsplit('/').next().unwrap_or(link).to_string())
+        .collect()
 }
 
 /// Every file in the cache, including interrupted downloads. Returns the bytes freed.
@@ -202,10 +418,10 @@ struct Checksum {
     hex: String,
 }
 
-/// Find `file` in a checksum file. Handles GNU (`<hex>  <file>`, `<hex> *<file>`) and
-/// BSD (`SHA512 (<file>) = <hex>`) lines, and tells SHA-256 from SHA-512 by length.
-fn parse_sums(text: &str, file: &str) -> Option<Checksum> {
-    text.lines().find_map(|line| {
+/// Every (file, checksum) in a checksum file. Handles GNU (`<hex>  <file>`, `<hex> *<file>`)
+/// and BSD (`SHA256 (<file>) = <hex>`) lines, and tells SHA-256 from SHA-512 by length.
+fn parse_sums(text: &str) -> impl Iterator<Item = (String, Checksum)> {
+    text.lines().filter_map(|line| {
         let (name, hex) = match line.split_once(") = ") {
             Some((left, hex)) => (left.split_once(" (")?.1, hex.trim()),
             None => {
@@ -218,9 +434,15 @@ fn parse_sums(text: &str, file: &str) -> Option<Checksum> {
             128 => Alg::Sha512,
             _ => return None,
         };
-        (name == file && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| Checksum { alg, hex: hex.to_ascii_lowercase() })
+        hex.bytes()
+            .all(|b| b.is_ascii_hexdigit())
+            .then(|| (name.to_string(), Checksum { alg, hex: hex.to_ascii_lowercase() }))
     })
+}
+
+/// The checksum of the last file matching `pattern`, in sort order.
+fn newest_sum(text: &str, pattern: &str) -> Option<(String, Checksum)> {
+    parse_sums(text).filter(|(name, _)| glob(pattern, name)).max_by(|a, b| a.0.cmp(&b.0))
 }
 
 #[derive(Debug)]
@@ -320,30 +542,97 @@ mod tests {
 
     const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    fn sum(text: &str, pattern: &str) -> Option<Checksum> {
+        newest_sum(text, pattern).map(|(_, sum)| sum)
+    }
+
     #[test]
     fn parses_gnu_sums() {
         let sha512 = "a".repeat(128);
         let text = format!(
             "{SHA256}  debian-13-genericcloud-amd64.json\n{sha512}  debian-13-genericcloud-arm64.qcow2\n"
         );
-        let sum = parse_sums(&text, "debian-13-genericcloud-arm64.qcow2").unwrap();
-        assert_eq!(sum, Checksum { alg: Alg::Sha512, hex: sha512 });
+        let found = sum(&text, "debian-13-genericcloud-arm64.qcow2").unwrap();
+        assert_eq!(found, Checksum { alg: Alg::Sha512, hex: sha512 });
     }
 
     #[test]
     fn parses_binary_marker_and_bsd_style() {
         let ubuntu = format!("{SHA256} *ubuntu-24.04-server-cloudimg-arm64.img\n");
-        assert_eq!(parse_sums(&ubuntu, "ubuntu-24.04-server-cloudimg-arm64.img").unwrap().alg, Alg::Sha256);
-        let bsd = format!("SHA256 (disk.qcow2) = {}\n", SHA256.to_uppercase());
-        assert_eq!(parse_sums(&bsd, "disk.qcow2").unwrap().hex, SHA256);
+        assert_eq!(sum(&ubuntu, "ubuntu-24.04-server-cloudimg-arm64.img").unwrap().alg, Alg::Sha256);
+        let rocky = format!(
+            "# Rocky-10-GenericCloud-Base.latest.aarch64.qcow2: 469368832 bytes\n\
+             SHA256 (Rocky-10-GenericCloud-Base.latest.aarch64.qcow2) = {}\n",
+            SHA256.to_uppercase()
+        );
+        assert_eq!(sum(&rocky, "Rocky-10-GenericCloud-Base.latest.aarch64.qcow2").unwrap().hex, SHA256);
     }
 
     #[test]
     fn ignores_other_files_and_bad_digests() {
         let text = format!("{SHA256}  other.qcow2\nnothex  disk.qcow2\n{}  disk.qcow2\n", "z".repeat(64));
-        assert_eq!(parse_sums(&text, "disk.qcow2"), None);
+        assert_eq!(sum(&text, "disk.qcow2"), None);
         // A file name that merely contains ours doesn't count.
-        assert_eq!(parse_sums(&format!("{SHA256}  disk.qcow2.sig\n"), "disk.qcow2"), None);
+        assert_eq!(sum(&format!("{SHA256}  disk.qcow2.sig\n"), "disk.qcow2"), None);
+    }
+
+    #[test]
+    fn finds_versioned_names() {
+        let fedora = format!(
+            "SHA256 (Fedora-Cloud-Base-AmazonEC2-44-1.7.aarch64.raw.xz) = {SHA256}\n\
+             SHA256 (Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2) = {SHA256}\n"
+        );
+        let (name, _) = newest_sum(&fedora, "Fedora-Cloud-Base-Generic-44-*.aarch64.qcow2").unwrap();
+        assert_eq!(name, "Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2");
+
+        let amazon = format!("{SHA256}  al2023-kvm-2023.12.20260930.0-kernel-6.1-arm64.xfs.gpt.qcow2\n");
+        let (name, _) = newest_sum(&amazon, "al2023-kvm-*-arm64.xfs.gpt.qcow2").unwrap();
+        assert_eq!(name, "al2023-kvm-2023.12.20260930.0-kernel-6.1-arm64.xfs.gpt.qcow2");
+    }
+
+    #[test]
+    fn globs() {
+        assert!(glob("a-*.qcow2", "a-1.7.qcow2"));
+        assert!(glob("exact.qcow2", "exact.qcow2"));
+        assert!(!glob("a-*.qcow2", "a-1.7.qcow2.sig"));
+        assert!(!glob("ab*ba", "aba")); // prefix and suffix can't overlap
+    }
+
+    #[test]
+    fn reads_directory_listings() {
+        let apache = r#"<a href="?C=N;O=D">Name</a> <a href="../">Parent</a>
+            <a href="Fedora-Cloud-44-1.7-aarch64-CHECKSUM">x</a> <a href="./Leap-16.0.qcow2">y</a>
+            <a href="/pub/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2">z</a>"#;
+        assert_eq!(
+            hrefs(apache),
+            ["Fedora-Cloud-44-1.7-aarch64-CHECKSUM", "Leap-16.0.qcow2", "Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"]
+        );
+        let found = newest(hrefs(apache), "Fedora-Cloud-44-*-aarch64-CHECKSUM");
+        assert_eq!(found.as_deref(), Some("Fedora-Cloud-44-1.7-aarch64-CHECKSUM"));
+    }
+
+    #[test]
+    fn catalog_is_consistent() {
+        let mut names: Vec<_> = CATALOG.iter().map(|i| i.name).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), CATALOG.len(), "duplicate image names");
+        assert!(CATALOG.iter().any(|i| i.name == DEFAULT));
+        for image in CATALOG {
+            assert!(image.aarch64.is_some() || image.x86_64.is_some(), "{}", image.name);
+            assert!(image.dir.starts_with("https://") && image.dir.ends_with('/'), "{}", image.name);
+            for template in [image.dir, image.file, image.sums] {
+                assert!(template.matches('*').count() <= 1, "{}: {template}", image.name);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_arch_suggests_emulation() {
+        let arch = CATALOG.iter().find(|i| i.name == "archlinux").unwrap();
+        assert!(arch.supports(Arch::X86_64));
+        let e = arch.spelling(Arch::Aarch64).err().unwrap();
+        assert_eq!(e.to_string(), "archlinux has no aarch64 build");
     }
 
     #[test]
@@ -353,9 +642,26 @@ mod tests {
         assert_eq!(h.hex(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 
+    /// Hits the network: `cargo test -- --ignored catalog_resolves`. Reads only directory
+    /// listings and checksum files, and sends a HEAD request for each image.
     #[test]
-    fn file_names_per_arch() {
-        assert_eq!(CATALOG[0].file(Arch::Aarch64), "debian-13-genericcloud-arm64.qcow2");
-        assert_eq!(CATALOG[1].file(Arch::X86_64), "ubuntu-24.04-server-cloudimg-amd64.img");
+    #[ignore]
+    fn catalog_resolves() {
+        let mut failures = Vec::new();
+        for image in CATALOG {
+            for arch in [Arch::Aarch64, Arch::X86_64] {
+                let Ok(spelling) = image.spelling(arch) else { continue };
+                let result = image.resolve(spelling).and_then(|(url, sum)| {
+                    let resp = agent().head(&url).call().map_err(|e| network_error(e, &url))?;
+                    let mb = resp.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+                    Ok((url, sum, mb.unwrap_or(0) / 1_000_000))
+                });
+                match result {
+                    Ok((url, sum, mb)) => println!("ok   {:20} {arch:8} {mb:>5} MB  {:?} {}…  {url}", image.name, sum.alg, &sum.hex[..12]),
+                    Err(e) => failures.push(format!("{} {arch}: {e:#}", image.name)),
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

@@ -219,6 +219,7 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
     spec.cpus = args.cpus.unwrap_or(spec.cpus);
     spec.memory = args.mem.unwrap_or(spec.memory);
     spec.validate()?;
+    source.check_arch(spec.arch)?;
 
     // Check the tools exist before spending minutes on a download.
     let backend = backend::get(&spec.backend)?;
@@ -289,12 +290,20 @@ fn images(home: &Home, prune: bool) -> Result<()> {
         return Ok(());
     }
     let arch = Arch::host()?;
-    println!("{:13}  {:19}  {:>8}  CACHED", "IMAGE", "DESCRIPTION", "DOWNLOAD");
+    let name_w = image::CATALOG.iter().map(|i| i.name.len()).max().unwrap_or(0);
+    let title_w = image::CATALOG.iter().map(|i| i.title.len()).max().unwrap_or(0);
+    println!("{:name_w$}  {:title_w$}  {:>8}  CACHED", "IMAGE", "DESCRIPTION", "DOWNLOAD");
     for img in image::CATALOG {
         let cached = if img.cached(home, arch).is_empty() { "-" } else { "yes" };
-        let default = if img.name == image::DEFAULT { "  (default)" } else { "" };
+        let note = if img.name == image::DEFAULT {
+            "(default)".to_string()
+        } else if !img.supports(arch) {
+            "(x86_64 only)".to_string()
+        } else {
+            String::new()
+        };
         let size = format!("~{} MB", img.size_mb);
-        let row = format!("{:13}  {:19}  {size:>8}  {cached:6}{default}", img.name, img.title);
+        let row = format!("{:name_w$}  {:title_w$}  {size:>8}  {cached:6}  {note}", img.name, img.title);
         println!("{}", row.trim_end());
     }
     println!();
