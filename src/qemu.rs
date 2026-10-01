@@ -10,8 +10,8 @@ use std::{fs, io, thread};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
-use crate::backend::{Backend, CommandLine, Console, Pause, State};
-use crate::host::{Arch, Os};
+use crate::backend::{Backend, Check, CommandLine, Console, Pause, State};
+use crate::host::{self, Arch, Os};
 use crate::vx::Vm;
 use crate::{hinted, qmp};
 use probe::Host;
@@ -24,8 +24,20 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Qemu;
 
 impl Backend for Qemu {
-    fn create(&self, _vm: &Vm, _image: &Path, _disk: &str) -> Result<()> {
-        todo!("copy image to disk.qcow2, qemu-img resize")
+    fn create(&self, vm: &Vm, image: &Path, disk: &str) -> Result<()> {
+        let qemu_img = host::which("qemu-img").ok_or_else(|| hinted("qemu-img not found", probe::install_hint(Os::host())))?;
+        let target = vm.path("disk.qcow2");
+        let info = host::run(Command::new(&qemu_img).args(["info", "--output=json"]).arg(image))?;
+        let info: Value = serde_json::from_str(&info).context("reading qemu-img info")?;
+        if info["format"] == "qcow2" {
+            // A copy-on-write clone on APFS, btrfs and XFS, so it's instant and takes no space.
+            fs::copy(image, &target).with_context(|| format!("copying {}", image.display()))?;
+        } else {
+            host::run(Command::new(&qemu_img).args(["convert", "-O", "qcow2"]).arg(image).arg(&target))?;
+        }
+        // The guest's cloud-init grows its root filesystem to fill the disk on first boot.
+        host::run(Command::new(&qemu_img).args(["resize", "-q"]).arg(&target).arg(disk))?;
+        Ok(())
     }
 
     fn start(&self, vm: &Vm) -> Result<()> {
@@ -93,6 +105,15 @@ impl Backend for Qemu {
 
     fn ssh_addr(&self, vm: &Vm) -> SocketAddr {
         SocketAddr::from((Ipv4Addr::LOCALHOST, vm.spec.ssh.port))
+    }
+
+    fn checks(&self) -> Vec<Check> {
+        let hint = Some(probe::install_hint(Os::host()).to_string());
+        let qemu = Arch::host().and_then(Host::probe);
+        vec![
+            Check { name: "QEMU".into(), ok: qemu.is_ok(), hint: hint.clone() },
+            Check { name: "qemu-img".into(), ok: host::which("qemu-img").is_some(), hint },
+        ]
     }
 
     fn pause(&self) -> Option<&dyn Pause> {

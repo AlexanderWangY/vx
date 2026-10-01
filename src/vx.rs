@@ -272,11 +272,11 @@ impl Spec {
             backend: "qemu".into(),
             image: "debian-13".into(),
             arch: Arch::host()?,
-            cpus: 4,
+            cpus: std::thread::available_parallelism().map_or(4, |n| n.get().min(4) as u32),
             memory: "4G".into(),
             forward: vec![],
             ssh: SshSpec {
-                user: env::var("USER").ok().filter(|u| !u.is_empty()).unwrap_or_else(|| "vx".into()),
+                user: guest_user(&env::var("USER").unwrap_or_default()),
                 port: FIRST_SSH_PORT,
             },
             qemu: None,
@@ -296,7 +296,7 @@ impl Spec {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.cpus >= 1, "cpus must be at least 1");
         ensure!(is_size(&self.memory), "memory `{}` should look like 4G, 512M or 4096", self.memory);
-        ensure!(!self.ssh.user.is_empty(), "ssh.user is empty");
+        ensure!(is_user(&self.ssh.user), "ssh.user `{}` isn't a valid Linux user name", self.ssh.user);
         ensure!(self.ssh.port != 0, "ssh.port can't be 0");
         let mut hosts = HashSet::from([self.ssh.port]);
         for f in &self.forward {
@@ -329,6 +329,31 @@ pub fn validate_name(name: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Accounts cloud images already have, or that would clash with system groups.
+const TAKEN_USERS: &[&str] = &[
+    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail", "news", "uucp", "proxy",
+    "www-data", "backup", "list", "irc", "nobody", "admin", "sshd", "debian", "ubuntu", "lxd",
+];
+
+/// Your user name, made safe for the guest: lowercased, invalid characters dropped,
+/// and `dev` if nothing usable is left or the image already has that account.
+fn guest_user(host_user: &str) -> String {
+    let user: String = host_user
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'))
+        .take(32)
+        .collect();
+    if is_user(&user) && !TAKEN_USERS.contains(&user.as_str()) { user } else { "dev".into() }
+}
+
+/// `^[a-z_][a-z0-9_-]{0,31}$`
+fn is_user(s: &str) -> bool {
+    s.len() <= 32
+        && s.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 /// "8080:80" → (8080, 80)
@@ -444,6 +469,17 @@ mod tests {
         for text in bad {
             assert!(Spec::from_toml(&text).is_err(), "accepted:\n{text}");
         }
+    }
+
+    #[test]
+    fn guest_users() {
+        assert_eq!(guest_user("alexawang"), "alexawang");
+        assert_eq!(guest_user("Alexa.Wang"), "alexawang");
+        assert_eq!(guest_user("root"), "dev");
+        assert_eq!(guest_user("ubuntu"), "dev");
+        assert_eq!(guest_user("1st"), "dev");
+        assert_eq!(guest_user(""), "dev");
+        assert_eq!(guest_user(&"a".repeat(40)).len(), 32);
     }
 
     #[test]

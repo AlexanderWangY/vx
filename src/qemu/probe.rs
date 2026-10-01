@@ -53,11 +53,14 @@ fn find_qemu(os: Os, arch: Arch, guest: Arch) -> Result<PathBuf> {
     if os == Os::Linux && guest == arch && rhel.exists() {
         return Ok(rhel.into());
     }
-    let hint = match os {
-        Os::Macos => "brew install qemu".into(),
-        Os::Linux => format!("install {name} with your package manager"),
-    };
-    Err(hinted(format!("{name} not found"), hint))
+    Err(hinted(format!("{name} not found"), install_hint(os)))
+}
+
+pub fn install_hint(os: Os) -> &'static str {
+    match os {
+        Os::Macos => "brew install qemu",
+        Os::Linux => "install QEMU with your package manager, e.g. `sudo apt install qemu-system qemu-utils`",
+    }
 }
 
 fn native_accel(os: Os, qemu: &Path) -> Result<&'static str, String> {

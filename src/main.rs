@@ -4,19 +4,26 @@ mod backend;
 mod console;
 #[allow(dead_code)]
 mod host;
+mod image;
+mod progress;
 #[allow(dead_code)]
 mod qemu;
 mod qmp;
+mod seed;
+mod ssh;
 #[allow(dead_code)]
 mod vx;
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 use backend::State;
-use vx::{Home, Vm};
+use host::Arch;
+use image::Source;
+use vx::{Home, Spec, Vm};
 
 /// Zero-config Linux VMs from the terminal.
 #[derive(Parser)]
@@ -29,7 +36,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create and boot a new VM
-    New { name: String },
+    New(NewArgs),
     /// List VMs
     Ls,
     /// Start a VM
@@ -41,8 +48,13 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// SSH into a VM
-    Ssh { name: String },
+    /// SSH into a VM, starting it first if needed
+    Ssh {
+        name: String,
+        /// A command to run instead of a shell
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
     /// Attach to a VM's serial console (Ctrl-] to detach)
     Console { name: String },
     /// Print a VM's boot log
@@ -54,6 +66,39 @@ enum Command {
     },
     /// Stop and delete a VM
     Rm { name: String },
+    /// List the images `vx new` can use
+    Images {
+        /// Delete every cached download (VMs keep their own disks)
+        #[arg(long)]
+        prune: bool,
+    },
+}
+
+#[derive(clap::Args)]
+struct NewArgs {
+    name: String,
+    /// An image from `vx images`, or a path to a qcow2 file
+    #[arg(long, default_value = image::DEFAULT)]
+    image: String,
+    /// Virtual CPUs [default: 4, or fewer on smaller hosts]
+    #[arg(long)]
+    cpus: Option<u32>,
+    /// Memory, e.g. 4G or 512M [default: 4G]
+    #[arg(long, value_parser = size)]
+    mem: Option<String>,
+    /// Disk size, e.g. 20G
+    #[arg(long, value_parser = size, default_value = "20G")]
+    disk: String,
+    /// Guest architecture: aarch64 or x86_64. Another arch than the host's is emulated (slow).
+    #[arg(long)]
+    arch: Option<Arch>,
+    /// Create the VM without starting it
+    #[arg(long)]
+    no_start: bool,
+}
+
+fn size(s: &str) -> Result<String, String> {
+    if vx::is_size(s) { Ok(s.into()) } else { Err("use a size like 4G, 512M or 4096".into()) }
 }
 
 /// An error that ends with a `hint:` line telling the user how to fix it.
@@ -92,14 +137,15 @@ fn run(cli: Cli) -> Result<()> {
     };
     let home = Home::from_env()?;
     match command {
-        Command::New { name } => println!("new {name}"),
+        Command::New(args) => new(&home, args)?,
         Command::Ls => ls(&home)?,
         Command::Start { name } => start(&home.load(&name)?)?,
         Command::Stop { name, force } => stop(&home.load(&name)?, force)?,
-        Command::Ssh { name } => println!("ssh {name}"),
+        Command::Ssh { name, command } => ssh(&home, &home.load(&name)?, &command)?,
         Command::Console { name } => attach(&home.load(&name)?)?,
         Command::Logs { name, follow } => console::logs(&home.load(&name)?, follow)?,
         Command::Rm { name } => println!("rm {name}"),
+        Command::Images { prune } => images(&home, prune)?,
     }
     Ok(())
 }
@@ -161,4 +207,102 @@ fn attach(vm: &Vm) -> Result<()> {
         return Err(hinted(format!("{} isn't running", vm.name), format!("vx start {}", vm.name)));
     }
     console::attach(&vm.name, c.attach(vm)?)
+}
+
+fn new(home: &Home, args: NewArgs) -> Result<()> {
+    let started = Instant::now();
+    home.check_new_name(&args.name)?;
+    let source = Source::parse(&args.image)?;
+    let mut spec = Spec::defaults()?;
+    spec.image = source.name();
+    spec.arch = args.arch.unwrap_or(spec.arch);
+    spec.cpus = args.cpus.unwrap_or(spec.cpus);
+    spec.memory = args.mem.unwrap_or(spec.memory);
+    spec.validate()?;
+
+    // Check the tools exist before spending minutes on a download.
+    let backend = backend::get(&spec.backend)?;
+    if let Some(c) = backend.checks().into_iter().chain(ssh::checks()).find(|c| !c.ok) {
+        return Err(hinted(format!("{} not found", c.name), c.hint.unwrap_or_default()));
+    }
+
+    eprintln!(
+        "  {} · {} · {} CPUs · {} RAM · {} disk",
+        source.title(),
+        spec.arch,
+        spec.cpus,
+        spec.memory,
+        args.disk
+    );
+    let image = source.fetch(home, spec.arch)?;
+    let client_key = ssh::client_key(home)?;
+    spec.ssh.port = home.next_ssh_port()?;
+    let vm = home.create(&args.name, spec, |vm| {
+        backend.create(vm, &image, &args.disk)?;
+        let host_key = ssh::host_key(vm)?;
+        seed::write(vm, &client_key, &host_key)
+    })?;
+    let config = ssh::write_config(home, &vm, backend.ssh_addr(&vm))?;
+    eprintln!("  ✓ disk  ✓ keys  ✓ cloud-init  ✓ ssh port {}", vm.spec.ssh.port);
+
+    if args.no_start {
+        eprintln!("  ✓ {} created; start it with `vx start {0}`", vm.name);
+        return Ok(());
+    }
+    {
+        let _lock = vm.lock()?;
+        backend.start(&vm)?;
+    }
+    ssh::wait_ready(&config, &vm, backend, boot_timeout(&vm))?;
+    ssh::wait_cloud_init(&config, &vm)?;
+    eprintln!(
+        "  ✓ {} is ready ({} s)    vx ssh {0}  ·  vx console {0}  ·  vx stop {0}",
+        vm.name,
+        started.elapsed().as_secs()
+    );
+    Ok(())
+}
+
+fn ssh(home: &Home, vm: &Vm, command: &[String]) -> Result<()> {
+    let backend = backend::get(&vm.spec.backend)?;
+    let config = ssh::write_config(home, vm, backend.ssh_addr(vm))?;
+    if backend.state(vm) == State::Stopped {
+        {
+            let _lock = vm.lock()?;
+            backend.start(vm)?;
+        }
+        ssh::wait_ready(&config, vm, backend, boot_timeout(vm))?;
+    }
+    ssh::exec(&config, vm, command)
+}
+
+/// Emulated guests boot many times slower.
+fn boot_timeout(vm: &Vm) -> Duration {
+    let native = Arch::host().is_ok_and(|a| a == vm.spec.arch);
+    Duration::from_secs(if native { 180 } else { 900 })
+}
+
+fn images(home: &Home, prune: bool) -> Result<()> {
+    if prune {
+        let freed = image::prune(home)?;
+        println!("removed {} of cached images", progress::bytes(freed));
+        return Ok(());
+    }
+    let arch = Arch::host()?;
+    println!("{:13}  {:19}  {:>8}  CACHED", "IMAGE", "DESCRIPTION", "DOWNLOAD");
+    for img in image::CATALOG {
+        let cached = if img.cached(home, arch).is_empty() { "-" } else { "yes" };
+        let default = if img.name == image::DEFAULT { "  (default)" } else { "" };
+        let size = format!("~{} MB", img.size_mb);
+        let row = format!("{:13}  {:19}  {size:>8}  {cached:6}{default}", img.name, img.title);
+        println!("{}", row.trim_end());
+    }
+    println!();
+    println!("vx new <name> --image <image>   or pass a path to a qcow2 file");
+    println!(
+        "cache: {} ({}); `vx images --prune` empties it",
+        home.images().display(),
+        progress::bytes(image::cache_size(home))
+    );
+    Ok(())
 }
