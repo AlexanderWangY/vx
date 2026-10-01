@@ -1,15 +1,25 @@
 mod probe;
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+use std::{fs, io, thread};
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
+use serde_json::Value;
 
 use crate::backend::{Backend, CommandLine, Console, Pause, State};
 use crate::host::{Arch, Os};
 use crate::vx::Vm;
+use crate::{hinted, qmp};
 use probe::Host;
+
+/// How long a guest gets to react to the power button before it's forced off.
+const POWERDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long QEMU gets to exit after `quit` or SIGKILL.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Qemu;
 
@@ -18,20 +28,71 @@ impl Backend for Qemu {
         todo!("copy image to disk.qcow2, qemu-img resize")
     }
 
-    fn start(&self, _vm: &Vm) -> Result<()> {
-        todo!("spawn qemu-system-* -daemonize")
+    fn start(&self, vm: &Vm) -> Result<()> {
+        let host = Host::probe(vm.spec.arch)?;
+        match (&host.accel, vm.spec.arch == host.arch) {
+            (Ok(_), true) => {}
+            (Err(why), true) => eprintln!("warning: {why}\nwarning: {} will run emulated, which is much slower", vm.name),
+            (_, false) => eprintln!(
+                "warning: {} is an {} VM on an {} host, so it will run emulated, which is much slower",
+                vm.name, vm.spec.arch, host.arch
+            ),
+        }
+
+        // With -daemonize, QEMU exits once the VM is set up and its sockets are listening.
+        let out = Command::new(&host.qemu)
+            .args(argv(vm, &host))
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("running {}", host.qemu.display()))?;
+        if out.status.success() {
+            return Ok(());
+        }
+
+        let log_path = vm.path("qemu.log");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        let why = last_line(&stderr).or_else(|| last_line(&log)).unwrap_or("no error output");
+        let hint = match start_hint(&format!("{stderr}\n{log}")) {
+            Some(hint) => hint.to_string(),
+            None => format!("QEMU's log is in {}", log_path.display()),
+        };
+        Err(hinted(format!("QEMU could not start {}: {why}", vm.name), hint))
     }
 
-    fn stop(&self, _vm: &Vm, _force: bool) -> Result<()> {
-        todo!("system_powerdown -> quit -> SIGKILL")
+    fn stop(&self, vm: &Vm, force: bool) -> Result<()> {
+        let sock = vm.path("qmp.sock");
+        // A paused guest can't react to the power button, so it goes straight to `quit`.
+        if !force && self.state(vm) == State::Running {
+            qmp::call(&sock, "system_powerdown")?;
+            eprintln!("waiting for {} to shut down…", vm.name);
+            if self.wait_until_stopped(vm, POWERDOWN_TIMEOUT) {
+                return Ok(());
+            }
+            eprintln!("{} ignored the shutdown request; forcing it off", vm.name);
+        }
+
+        let _ = qmp::call(&sock, "quit"); // QEMU may exit before it replies
+        if self.wait_until_stopped(vm, EXIT_TIMEOUT) {
+            return Ok(());
+        }
+
+        // QMP still answers, so the pidfile belongs to a live QEMU.
+        let pid = read_pid(vm)?;
+        // SAFETY: kill(2) has no memory-safety preconditions.
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+            return Err(io::Error::last_os_error()).with_context(|| format!("killing QEMU (pid {pid})"));
+        }
+        ensure!(self.wait_until_stopped(vm, EXIT_TIMEOUT), "{} is still running after SIGKILL", vm.name);
+        Ok(())
     }
 
-    fn state(&self, _vm: &Vm) -> State {
-        todo!("query-status over QMP")
+    fn state(&self, vm: &Vm) -> State {
+        state_from(qmp::call(&vm.path("qmp.sock"), "query-status"))
     }
 
-    fn ssh_addr(&self, _vm: &Vm) -> SocketAddr {
-        todo!("127.0.0.1:<ssh port from vx.toml>")
+    fn ssh_addr(&self, vm: &Vm) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, vm.spec.ssh.port))
     }
 
     fn pause(&self) -> Option<&dyn Pause> {
@@ -47,19 +108,33 @@ impl Backend for Qemu {
     }
 }
 
+impl Qemu {
+    fn wait_until_stopped(&self, vm: &Vm, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.state(vm) == State::Stopped {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        false
+    }
+}
+
 impl Pause for Qemu {
-    fn pause(&self, _vm: &Vm) -> Result<()> {
-        todo!("QMP stop")
+    fn pause(&self, vm: &Vm) -> Result<()> {
+        qmp::call(&vm.path("qmp.sock"), "stop").map(drop)
     }
 
-    fn resume(&self, _vm: &Vm) -> Result<()> {
-        todo!("QMP cont")
+    fn resume(&self, vm: &Vm) -> Result<()> {
+        qmp::call(&vm.path("qmp.sock"), "cont").map(drop)
     }
 }
 
 impl Console for Qemu {
-    fn attach(&self, _vm: &Vm) -> Result<UnixStream> {
-        todo!("connect to serial.sock")
+    fn attach(&self, vm: &Vm) -> Result<UnixStream> {
+        let sock = vm.path("serial.sock");
+        UnixStream::connect(&sock).with_context(|| format!("connecting to {}", sock.display()))
     }
 }
 
@@ -71,6 +146,54 @@ impl CommandLine for Qemu {
         Ok(a)
     }
 }
+
+/// Map a `query-status` reply, or the reason there wasn't one, to a `State`.
+fn state_from(reply: Result<Value>) -> State {
+    match reply {
+        Ok(r) => match r["status"].as_str() {
+            Some("running") => State::Running,
+            Some("paused") => State::Paused,
+            Some(other) => State::Other(other.into()), // e.g. "io-error": the host disk is full
+            None => State::Other("unknown".into()),
+        },
+        Err(e) => match e.chain().find_map(|c| c.downcast_ref::<io::Error>()).map(io::Error::kind) {
+            // No socket, or a stale one left behind by a crash.
+            Some(io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => State::Stopped,
+            // Connected but no greeting: another client holds QEMU's only QMP slot.
+            Some(io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => State::Running,
+            _ => State::Other(format!("unknown ({e})")),
+        },
+    }
+}
+
+/// Known QEMU startup errors and how to fix them.
+fn start_hint(output: &str) -> Option<&'static str> {
+    const HINTS: &[(&str, &str)] = &[
+        (
+            "Could not set up host forwarding rule",
+            "another program is using one of this VM's ports; change [ssh] port or forward in vx.toml",
+        ),
+        ("Failed to get \"write\" lock", "another QEMU is already using this VM's disk"),
+        ("com.apple.security.hypervisor", "QEMU isn't signed for HVF; run `brew reinstall qemu`"),
+        ("HV_DENIED", "QEMU isn't signed for HVF; run `brew reinstall qemu`"),
+        (
+            "Could not find ROM image",
+            "aarch64 UEFI firmware is missing; install qemu-efi-aarch64 (Debian, Ubuntu) or edk2-aarch64 (Fedora)",
+        ),
+    ];
+    HINTS.iter().find(|(needle, _)| output.contains(needle)).map(|(_, hint)| *hint)
+}
+
+fn last_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).rfind(|l| !l.is_empty())
+}
+
+fn read_pid(vm: &Vm) -> Result<i32> {
+    let path = vm.path("qemu.pid");
+    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    text.trim().parse().with_context(|| format!("no pid in {}", path.display()))
+}
+
 
 /// Every QEMU argument for `vm` on `host`, after the binary. Pure, so it's golden-tested,
 /// and `vx cmd` prints it verbatim: nothing about how a VM runs is hidden.
@@ -280,5 +403,31 @@ mod tests {
         vm.dir = "/Users/a,b/.vx/vms/dev".into();
         let argv = argv(&vm, &host(Os::Macos, Arch::Aarch64, Ok("hvf")));
         assert_eq!(value(&argv, "-pidfile"), Some("/Users/a,,b/.vx/vms/dev/qemu.pid"));
+    }
+
+    #[test]
+    fn state_from_replies() {
+        let status = |s: &str| state_from(Ok(serde_json::json!({ "status": s, "running": s == "running" })));
+        assert_eq!(status("running"), State::Running);
+        assert_eq!(status("paused"), State::Paused);
+        assert_eq!(status("io-error"), State::Other("io-error".into()));
+    }
+
+    #[test]
+    fn state_from_connection_errors() {
+        let err = |kind: io::ErrorKind| state_from(Err(io::Error::from(kind).into()));
+        assert_eq!(err(io::ErrorKind::NotFound), State::Stopped);
+        assert_eq!(err(io::ErrorKind::ConnectionRefused), State::Stopped);
+        assert_eq!(err(io::ErrorKind::WouldBlock), State::Running);
+        assert!(matches!(err(io::ErrorKind::PermissionDenied), State::Other(_)));
+    }
+
+    #[test]
+    fn start_hints() {
+        let port = "qemu-system-aarch64: -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22: \
+                    Could not set up host forwarding rule 'tcp:127.0.0.1:2222-:22'";
+        assert!(start_hint(port).unwrap().contains("[ssh] port"));
+        assert!(start_hint("Could not find ROM image 'edk2-aarch64-code.fd'").unwrap().contains("firmware"));
+        assert_eq!(start_hint("something new"), None);
     }
 }

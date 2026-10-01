@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -8,12 +9,24 @@ use crate::qemu;
 use crate::vx::Vm;
 
 /// Asked of the backend every time, never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
     Running,
     Paused,
     Stopped,
     /// Raw backend status we don't model, e.g. QEMU's "io-error".
     Other(String),
+}
+
+impl fmt::Display for State {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            State::Running => "running",
+            State::Paused => "paused",
+            State::Stopped => "stopped",
+            State::Other(s) => s,
+        })
+    }
 }
 
 /// One line of `vx doctor` output.
