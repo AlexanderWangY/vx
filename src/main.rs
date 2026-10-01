@@ -2,6 +2,7 @@
 #[allow(dead_code)]
 mod backend;
 mod console;
+mod form;
 #[allow(dead_code)]
 mod host;
 mod image;
@@ -15,6 +16,7 @@ mod ssh;
 mod vx;
 
 use std::fmt;
+use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -39,33 +41,38 @@ enum Command {
     New(NewArgs),
     /// List VMs
     Ls,
-    /// Start a VM
-    Start { name: String },
+    /// Start a VM (leave out the name to pick one)
+    Start { name: Option<String> },
     /// Stop a VM: power button first, then force it off
     Stop {
-        name: String,
+        name: Option<String>,
         /// Skip the power button and force it off right away
         #[arg(long)]
         force: bool,
     },
     /// SSH into a VM, starting it first if needed
     Ssh {
-        name: String,
+        name: Option<String>,
         /// A command to run instead of a shell
         #[arg(last = true)]
         command: Vec<String>,
     },
     /// Attach to a VM's serial console (Ctrl-] to detach)
-    Console { name: String },
+    Console { name: Option<String> },
     /// Print a VM's boot log
     Logs {
-        name: String,
+        name: Option<String>,
         /// Keep printing new output
         #[arg(short, long)]
         follow: bool,
     },
     /// Stop and delete a VM
-    Rm { name: String },
+    Rm {
+        name: Option<String>,
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// List the images `vx new` can use
     Images {
         /// Delete every cached download (VMs keep their own disks)
@@ -76,7 +83,11 @@ enum Command {
 
 #[derive(clap::Args)]
 struct NewArgs {
-    name: String,
+    /// Leave it out to fill in a form instead
+    name: Option<String>,
+    /// Fill in a form, starting from the other flags
+    #[arg(short, long)]
+    interactive: bool,
     /// An image from `vx images`, or a path to a qcow2 file
     #[arg(long, default_value = image::DEFAULT)]
     image: String,
@@ -136,18 +147,74 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     };
     let home = Home::from_env()?;
+    // A missing VM name opens a picker; `None` means it was cancelled.
+    let pick = |name, verb, question, prefer| pick(&home, name, verb, question, prefer);
     match command {
-        Command::New(args) => new(&home, args)?,
+        Command::New(args) => {
+            if let Some(args) = new_args(&home, args)? {
+                new(&home, args)?;
+            }
+        }
         Command::Ls => ls(&home)?,
-        Command::Start { name } => start(&home.load(&name)?)?,
-        Command::Stop { name, force } => stop(&home.load(&name)?, force)?,
-        Command::Ssh { name, command } => ssh(&home, &home.load(&name)?, &command)?,
-        Command::Console { name } => attach(&home.load(&name)?)?,
-        Command::Logs { name, follow } => console::logs(&home.load(&name)?, follow)?,
-        Command::Rm { name } => println!("rm {name}"),
+        Command::Start { name } => {
+            if let Some(vm) = pick(name, "start", "Which VM do you want to start?", Some(State::Stopped))? {
+                start(&vm)?;
+            }
+        }
+        Command::Stop { name, force } => {
+            if let Some(vm) = pick(name, "stop", "Which VM do you want to stop?", Some(State::Running))? {
+                stop(&vm, force)?;
+            }
+        }
+        Command::Ssh { name, command } => {
+            if let Some(vm) = pick(name, "ssh", "Which VM do you want to ssh into?", Some(State::Running))? {
+                ssh(&home, &vm, &command)?;
+            }
+        }
+        Command::Console { name } => {
+            if let Some(vm) = pick(name, "console", "Which VM's console?", Some(State::Running))? {
+                attach(&vm)?;
+            }
+        }
+        Command::Logs { name, follow } => {
+            if let Some(vm) = pick(name, "logs", "Which VM's boot log?", None)? {
+                console::logs(&vm, follow)?;
+            }
+        }
+        Command::Rm { name, yes } => {
+            if let Some(vm) = pick(name, "rm", "Which VM do you want to delete?", None)? {
+                rm(vm, yes)?;
+            }
+        }
         Command::Images { prune } => images(&home, prune)?,
     }
     Ok(())
+}
+
+/// The VM called `name`, or one picked from a list when the name is left out.
+fn pick(home: &Home, name: Option<String>, verb: &str, question: &str, prefer: Option<State>) -> Result<Option<Vm>> {
+    let name = match name {
+        Some(name) => name,
+        None if form::interactive() => match form::pick_vm(home, verb, question, prefer)? {
+            Some(name) => name,
+            None => return Ok(None),
+        },
+        None => return Err(hinted("which VM?", format!("vx {verb} <name>; `vx ls` lists them"))),
+    };
+    home.load(&name).map(Some)
+}
+
+/// `vx new`'s arguments, from a form when the name is missing or `-i` is given.
+fn new_args(home: &Home, args: NewArgs) -> Result<Option<NewArgs>> {
+    if !args.interactive && args.name.is_some() {
+        return Ok(Some(args));
+    }
+    if !form::interactive() {
+        return Err(hinted("vx new needs a name here", "vx new <name>; the form only opens in a terminal"));
+    }
+    let Some(args) = form::new_vm(home, args)? else { return Ok(None) };
+    eprintln!("  {}", form::command_line(&args)?);
+    Ok(Some(args))
 }
 
 fn ls(home: &Home) -> Result<()> {
@@ -198,6 +265,37 @@ fn stop(vm: &Vm, force: bool) -> Result<()> {
     Ok(())
 }
 
+fn rm(vm: Vm, yes: bool) -> Result<()> {
+    let backend = backend::get(&vm.spec.backend)?;
+    if !yes && !confirm(&vm)? {
+        println!("kept {}", vm.name);
+        return Ok(());
+    }
+    let _lock = vm.lock()?;
+    // Its disk is about to go, so there's nothing to shut down gracefully.
+    if backend.state(&vm) != State::Stopped {
+        backend.stop(&vm, true)?;
+    }
+    let name = vm.name.clone();
+    vm.delete()?;
+    println!("{name} deleted; cached images are kept");
+    Ok(())
+}
+
+fn confirm(vm: &Vm) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        return Err(hinted(
+            format!("not deleting {} without confirmation", vm.name),
+            format!("vx rm -y {}", vm.name),
+        ));
+    }
+    eprint!("delete {} and its disk? [y/N] ", vm.name);
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
 fn attach(vm: &Vm) -> Result<()> {
     let backend = backend::get(&vm.spec.backend)?;
     let Some(c) = backend.console() else {
@@ -211,7 +309,8 @@ fn attach(vm: &Vm) -> Result<()> {
 
 fn new(home: &Home, args: NewArgs) -> Result<()> {
     let started = Instant::now();
-    home.check_new_name(&args.name)?;
+    let name = args.name.clone().unwrap_or_default();
+    home.check_new_name(&name)?;
     let source = Source::parse(&args.image)?;
     let mut spec = Spec::defaults()?;
     spec.image = source.name();
@@ -238,7 +337,7 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
     let image = source.fetch(home, spec.arch)?;
     let client_key = ssh::client_key(home)?;
     spec.ssh.port = home.next_ssh_port()?;
-    let vm = home.create(&args.name, spec, |vm| {
+    let vm = home.create(&name, spec, |vm| {
         backend.create(vm, &image, &args.disk)?;
         let host_key = ssh::host_key(vm)?;
         seed::write(vm, &client_key, &host_key)
