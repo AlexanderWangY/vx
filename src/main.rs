@@ -109,7 +109,7 @@ struct SnapArgs {
 
 #[derive(Subcommand)]
 enum SnapCommand {
-    /// Show a VM's snapshots as a tree
+    /// List a VM's snapshots
     Ls { vm: Option<String> },
     /// Go back to a snapshot; the others are kept
     Restore {
@@ -472,40 +472,31 @@ fn snap_ls(vm: &Vm) -> Result<()> {
         println!("{} has no snapshots yet; take one with `vx snap {}`", vm.name, vm.name);
         return Ok(());
     }
-    let rows = history.rows();
     let name_w = history.entries.iter().map(|e| e.snap.name.chars().count()).max().unwrap_or(0);
-    for row in &rows {
-        let Some(i) = row.node else {
-            let graph: String = row.cells.iter().map(|c| c.text(' ')).collect();
-            println!("{}", OUT.dim(graph.trim_end()));
-            continue;
-        };
-        let e = &history.entries[i];
-        let mut graph = String::new();
-        for cell in &row.cells {
-            match cell {
-                snapshot::Cell::Node => graph += &format!("{}", OUT.green(cell.text(snapshot::marker(e)))),
-                _ => graph += &format!("{}", OUT.dim(cell.text(' '))),
-            }
-        }
+    for (i, e) in history.entries.iter().enumerate() {
         let name = format!("{:name_w$}", e.snap.name);
-        let name =
-            if history.current.as_deref() == Some(e.snap.name.as_str()) { OUT.accent(name).to_string() } else { name };
+        let here = history.current.as_deref() == Some(e.snap.name.as_str());
+        let name = if here { OUT.accent(name).to_string() } else { name };
         let memory = match e.snap.memory {
             0 => "disk only".to_string(),
             n => format!("{} memory", progress::bytes(n)),
         };
         let when = format!("{:>8}", snapshot::ago(e.snap.created));
-        let line = format!("{graph}{name}  {}  {}  {}", OUT.dim(when), OUT.dim(format!("{memory:>13}")), e.note);
+        // Where it was saved from, when that isn't the line above: after going back.
+        let note = match (history.from(i), e.note.as_str()) {
+            (Some(from), "") => OUT.dim(format!("from {from}")).to_string(),
+            (Some(from), note) => format!("{} {note}", OUT.dim(format!("from {from} ·"))),
+            (None, note) => note.to_string(),
+        };
+        let line = format!("{name}  {}  {}  {note}", OUT.dim(when), OUT.dim(format!("{memory:>13}")));
         println!("{}", line.trim_end());
     }
     println!();
     let state = backend::get(&vm.spec.backend)?.state(vm);
-    let at = match &history.current {
-        Some(at) => format!("{} is at {} ({state})", vm.name, OUT.accent(at)),
-        None => format!("{} isn't at any of them ({state})", vm.name),
-    };
-    println!("{at}{}", OUT.dim(" · ● memory and disk · ○ disk only"));
+    match &history.current {
+        Some(at) => println!("{} came from {} {}", vm.name, OUT.accent(at), OUT.dim(format!("({state})"))),
+        None => println!("{} isn't from any of them {}", vm.name, OUT.dim(format!("({state})"))),
+    }
     Ok(())
 }
 
