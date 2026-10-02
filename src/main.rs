@@ -474,9 +474,12 @@ fn snap_ls(vm: &Vm) -> Result<()> {
     }
     let name_w = history.entries.iter().map(|e| e.snap.name.chars().count()).max().unwrap_or(0);
     for (i, e) in history.entries.iter().enumerate() {
-        let name = format!("{:name_w$}", e.snap.name);
+        let marker = snapshot::marker(e);
+        let marker = if e.snap.memory > 0 { OUT.green(marker).to_string() } else { OUT.blue(marker).to_string() };
         let here = history.current.as_deref() == Some(e.snap.name.as_str());
-        let name = if here { OUT.accent(name).to_string() } else { name };
+        let label = format!(" {} ", e.snap.name);
+        let pad = " ".repeat(name_w - e.snap.name.chars().count());
+        let name = if here { format!("{}{pad}", OUT.label_here(label)) } else { format!("{label}{pad}") };
         let memory = match e.snap.memory {
             0 => "disk only".to_string(),
             n => format!("{} memory", progress::bytes(n)),
@@ -488,15 +491,24 @@ fn snap_ls(vm: &Vm) -> Result<()> {
             (Some(from), note) => format!("{} {note}", OUT.dim(format!("from {from} ·"))),
             (None, note) => note.to_string(),
         };
-        let line = format!("{name}  {}  {}  {note}", OUT.dim(when), OUT.dim(format!("{memory:>13}")));
+        let line = format!("{marker}{name} {}  {}  {note}", OUT.dim(when), OUT.dim(format!("{memory:>13}")));
         println!("{}", line.trim_end());
     }
     println!();
     let state = backend::get(&vm.spec.backend)?.state(vm);
     match &history.current {
-        Some(at) => println!("{} came from {} {}", vm.name, OUT.accent(at), OUT.dim(format!("({state})"))),
+        Some(at) => {
+            println!("{} came from {} {}", vm.name, OUT.label_here(format!(" {at} ")), OUT.dim(format!("({state})")))
+        }
         None => println!("{} isn't from any of them {}", vm.name, OUT.dim(format!("({state})"))),
     }
+    println!(
+        "{} {}   {} {}",
+        OUT.green('●'),
+        OUT.dim("resumes running: memory saved"),
+        OUT.blue('○'),
+        OUT.dim("boots from disk: disk only")
+    );
     Ok(())
 }
 
