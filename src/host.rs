@@ -66,9 +66,7 @@ impl fmt::Display for Arch {
 
 /// The first executable called `name` on PATH.
 pub fn which(name: &str) -> Option<PathBuf> {
-    env::split_paths(&env::var_os("PATH")?)
-        .map(|dir| dir.join(name))
-        .find(|p| is_executable(p))
+    env::split_paths(&env::var_os("PATH")?).map(|dir| dir.join(name)).find(|p| is_executable(p))
 }
 
 fn is_executable(path: &Path) -> bool {

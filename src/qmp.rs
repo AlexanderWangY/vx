@@ -107,8 +107,11 @@ mod tests {
             expect(r, "qmp_capabilities");
             writeln!(w, r#"{{"return": {{}}}}"#).unwrap();
             expect(r, "bogus");
-            writeln!(w, r#"{{"error": {{"class": "CommandNotFound", "desc": "The command bogus has not been found"}}}}"#)
-                .unwrap();
+            writeln!(
+                w,
+                r#"{{"error": {{"class": "CommandNotFound", "desc": "The command bogus has not been found"}}}}"#
+            )
+            .unwrap();
         });
         let e = call(&sock, "bogus").unwrap_err();
         assert!(e.to_string().contains("has not been found"), "{e}");

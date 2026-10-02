@@ -81,9 +81,16 @@ pub fn entries(home: &Home) -> Result<Vec<Entry>> {
 
 /// What the other threads tell the dashboard.
 enum Msg {
-    Snapshot { vms: Result<Vec<Entry>, String>, images: Vec<Info> },
+    Snapshot {
+        vms: Result<Vec<Entry>, String>,
+        images: Vec<Info>,
+    },
     /// A background job finished.
-    Done { target: Target, verb: Verb, result: Result<(), String> },
+    Done {
+        target: Target,
+        verb: Verb,
+        result: Result<(), String>,
+    },
 }
 
 /// Everything the main loop needs besides the app state.
@@ -271,7 +278,11 @@ enum Modal {
     /// Asking before deleting this VM.
     DeleteVm(String),
     /// Asking before deleting this image's local copy.
-    DeleteImage { name: String, size: u64, custom: bool },
+    DeleteImage {
+        name: String,
+        size: u64,
+        custom: bool,
+    },
     New(Box<NewForm>),
     AddImage(Box<AddImageForm>),
 }
@@ -479,7 +490,7 @@ impl App {
             cpus: None,
             mem: None,
             disk: "20G".into(),
-            arch: None,
+            arch: Some(self.host),
             no_start: false,
         };
         match NewForm::new(&self.home, args) {
@@ -695,7 +706,8 @@ impl App {
                 View::Vms => self.table.offset(),
                 View::Images => self.image_table.offset(),
             };
-            let mut scroll = ScrollbarState::new(rows.saturating_sub(visible)).position(offset).viewport_content_length(visible);
+            let mut scroll =
+                ScrollbarState::new(rows.saturating_sub(visible)).position(offset).viewport_content_length(visible);
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None)
@@ -714,8 +726,16 @@ impl App {
                 draw_confirm(frame, area, what, "Cached images are kept.");
             }
             Some(Modal::DeleteImage { name, size, custom }) => {
-                let what = vec![Span::raw("Delete "), Span::styled(name.clone(), HEADER), Span::raw(format!(" ({})?", bytes(*size)))];
-                let note = if *custom { "It was added by you; the original file isn't touched." } else { "VMs keep their own disks; you can download it again." };
+                let what = vec![
+                    Span::raw("Delete "),
+                    Span::styled(name.clone(), HEADER),
+                    Span::raw(format!(" ({})?", bytes(*size))),
+                ];
+                let note = if *custom {
+                    "It was added by you; the original file isn't touched."
+                } else {
+                    "VMs keep their own disks; you can download it again."
+                };
                 draw_confirm(frame, area, what, note);
             }
             Some(Modal::New(form)) => {
@@ -772,7 +792,10 @@ impl App {
             View::Images => {
                 let kept = self.images.iter().filter(|i| i.on_disk > 0).count();
                 let total: u64 = self.images.iter().map(|i| i.on_disk).sum();
-                spans.push(Span::styled(format!(" {} images · {kept} on disk · {}", self.images.len(), bytes(total)), DIM));
+                spans.push(Span::styled(
+                    format!(" {} images · {kept} on disk · {}", self.images.len(), bytes(total)),
+                    DIM,
+                ));
             }
         }
         if !spans.is_empty() {
@@ -893,7 +916,9 @@ impl App {
                         ]
                     }
                     // The full error shows in the bottom border when the row is selected.
-                    Err(_) => vec![Cell::from(clip(&entry.name, NAME_MAX)), Cell::from(Span::styled("✗ broken", ERROR))],
+                    Err(_) => {
+                        vec![Cell::from(clip(&entry.name, NAME_MAX)), Cell::from(Span::styled("✗ broken", ERROR))]
+                    }
                 };
                 Row::new(row).style(text)
             })
@@ -1078,12 +1103,8 @@ fn new_argv(args: &NewArgs) -> Vec<String> {
 fn spawn_job(io: &Io, job: Job) {
     let (tx, exe, home) = (io.tx.clone(), io.exe.clone(), io.home.clone());
     thread::spawn(move || {
-        let output = Command::new(exe)
-            .args(&job.args)
-            .env("VX_HOME", home)
-            .stdin(Stdio::null())
-            .process_group(0)
-            .output();
+        let output =
+            Command::new(exe).args(&job.args).env("VX_HOME", home).stdin(Stdio::null()).process_group(0).output();
         let result = match output {
             Ok(out) if out.status.success() => Ok(()),
             Ok(out) => Err(error_line(&String::from_utf8_lossy(&out.stderr))),
@@ -1163,7 +1184,8 @@ fn dialog(frame: &mut Frame, area: Rect, width: u16, height: u16, title: &str, b
     let [rect] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(row);
     frame.render_widget(Clear, rect);
     let title_style = if border == BORDER { ACCENT } else { border };
-    let title = Line::from(vec![Span::styled("─ ", border), Span::styled(title.to_string(), title_style), Span::raw(" ")]);
+    let title =
+        Line::from(vec![Span::styled("─ ", border), Span::styled(title.to_string(), title_style), Span::raw(" ")]);
     let block = Block::bordered().border_type(BorderType::Rounded).border_style(border).title(title);
     let inner = block.inner(rect).inner(Margin { horizontal: pad, vertical: 1 });
     frame.render_widget(block, rect);
@@ -1549,7 +1571,10 @@ mod tests {
         let mut app = with_vms();
         let _ = app.key(press(KeyCode::Char('?')));
         let text = screen(&mut app, 80, 26);
-        assert!(text.contains("─ keys ─") && text.contains("pause or resume") && text.contains("download it now"), "{text}");
+        assert!(
+            text.contains("─ keys ─") && text.contains("pause or resume") && text.contains("download it now"),
+            "{text}"
+        );
         assert_eq!(app.key(press(KeyCode::Char('q'))), Action::None); // closes help, doesn't quit
         assert!(app.modal.is_none());
         assert_eq!(app.key(press(KeyCode::Char('q'))), Action::Quit);
@@ -1565,7 +1590,8 @@ mod tests {
 
     #[test]
     fn scrollbar_only_when_rows_overflow() {
-        let many: Vec<Entry> = (0..12).map(|i| entry(&format!("vm-{i:02}"), State::Stopped, "debian-13", 2222 + i)).collect();
+        let many: Vec<Entry> =
+            (0..12).map(|i| entry(&format!("vm-{i:02}"), State::Stopped, "debian-13", 2222 + i)).collect();
         let mut app = App::new(&home(), Arch::Aarch64);
         app.update(many[..3].to_vec());
         assert!(!screen(&mut app, 72, 9).contains('┃'));

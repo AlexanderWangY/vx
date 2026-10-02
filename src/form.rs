@@ -242,7 +242,14 @@ impl NewForm {
         // `--image ./disk.qcow2` shows up as its own row.
         if let Source::File(path) = Source::parse(home, &args.image)? {
             let size = path.metadata().map(|m| bytes(m.len())).unwrap_or_default();
-            let file = Choice { arg: args.image.clone(), title: "local file".into(), size, cached: true, native: true, custom: false };
+            let file = Choice {
+                arg: args.image.clone(),
+                title: "local file".into(),
+                size,
+                cached: true,
+                native: true,
+                custom: false,
+            };
             images.insert(0, file);
         }
         let selected = images.iter().position(|c| c.arg == args.image).unwrap_or(0);
@@ -471,7 +478,8 @@ impl NewForm {
 
         // CPUs, memory and disk on one row.
         let mut spans = vec![Span::raw(MARGIN)];
-        for (field, title, width) in [(Field::Cpus, "CPUs", 6), (Field::Memory, "Memory", 6), (Field::Disk, "Disk", 6)] {
+        for (field, title, width) in [(Field::Cpus, "CPUs", 6), (Field::Memory, "Memory", 6), (Field::Disk, "Disk", 6)]
+        {
             let input = match field {
                 Field::Cpus => &self.cpus,
                 Field::Memory => &self.memory,
@@ -521,11 +529,19 @@ impl NewForm {
                 let choice = &self.images[self.selected];
                 if !choice.native {
                     return Span::styled(
-                        format!("no {} build, so it runs as {} under emulation (much slower)", self.arch, other(self.arch)),
+                        format!(
+                            "no {} build, so it runs as {} under emulation (much slower)",
+                            self.arch,
+                            other(self.arch)
+                        ),
                         WARN,
                     );
                 }
-                if choice.cached { "already downloaded".into() } else { format!("downloads {} once, then it's cached", choice.size) }
+                if choice.cached {
+                    "already downloaded".into()
+                } else {
+                    format!("downloads {} once, then it's cached", choice.size)
+                }
             }
             Field::Cpus => {
                 let n: usize = self.cpus.text.parse().unwrap_or(0);
@@ -574,7 +590,13 @@ impl AddImageForm {
     pub const HEIGHT: u16 = 6;
 
     pub fn new(home: &Home) -> AddImageForm {
-        AddImageForm { home: Home::at(home.root()), focus: 0, file: Input::default(), name: Input::default(), name_edited: false }
+        AddImageForm {
+            home: Home::at(home.root()),
+            focus: 0,
+            file: Input::default(),
+            name: Input::default(),
+            name_edited: false,
+        }
     }
 
     /// The file path, with `~` expanded.
@@ -608,10 +630,8 @@ impl AddImageForm {
     /// `~/Downloads/My Image.qcow2` → `my-image`
     fn name_from_file(&self) -> String {
         let stem = self.path().file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let name: String = stem
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '.') { c } else { '-' })
-            .collect();
+        let name: String =
+            stem.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '.') { c } else { '-' }).collect();
         name.trim_matches(|c: char| !c.is_ascii_alphanumeric()).chars().take(32).collect()
     }
 
@@ -661,11 +681,7 @@ impl AddImageForm {
                 let x = area.x + (LABEL + input.cursor - skip) as u16;
                 cursor = Some(Position::new(x, area.y + lines.len() as u16));
             }
-            lines.push(Line::from(vec![
-                Span::styled(format!("{title:LABEL$}"), label_style),
-                Span::raw(shown),
-                mark,
-            ]));
+            lines.push(Line::from(vec![Span::styled(format!("{title:LABEL$}"), label_style), Span::raw(shown), mark]));
         }
         lines.push(Line::default());
         lines.push(match self.problem(self.focus) {
@@ -998,7 +1014,9 @@ mod tests {
         assert_eq!(form.images[form.selected].arg, "archlinux");
         assert!(screen(&mut form, 80, 14).0.contains("runs as x86_64 under emulation"));
         let args = done(form.key(press(KeyCode::Enter)));
-        assert_eq!(args.arch, Some(Arch::X86_64));
+        // `--arch` is only passed when it differs from the host, which can be either.
+        let expected = (Arch::host().unwrap() != Arch::X86_64).then_some(Arch::X86_64);
+        assert_eq!(args.arch, expected);
     }
 
     #[test]
@@ -1032,7 +1050,8 @@ mod tests {
 
     #[test]
     fn picker_starts_on_the_preferred_state() {
-        let row = |name: &str, state| Row { name: name.into(), state: Some(state), detail: "aarch64  4 CPUs  4G".into() };
+        let row =
+            |name: &str, state| Row { name: name.into(), state: Some(state), detail: "aarch64  4 CPUs  4G".into() };
         let rows = vec![row("api", State::Stopped), row("dev", State::Running), row("web", State::Running)];
         let selected = rows.iter().position(|r| r.state == Some(State::Running)).unwrap();
         let mut picker = Picker { question: "Which VM?".into(), verb: "ssh".into(), rows, selected, scroll: 0 };

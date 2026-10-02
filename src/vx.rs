@@ -41,8 +41,7 @@ impl Home {
                 .context("can't find your home directory; set VX_HOME")?
                 .join(".vx"),
         };
-        let root = std::path::absolute(&root)
-            .with_context(|| format!("resolving VX_HOME {}", root.display()))?;
+        let root = std::path::absolute(&root).with_context(|| format!("resolving VX_HOME {}", root.display()))?;
         Ok(Home::at(root))
     }
 
@@ -128,7 +127,10 @@ impl Home {
         let len = dir.join(LONGEST_SOCKET).as_os_str().len();
         if len > MAX_SOCKET_PATH {
             return Err(hinted(
-                format!("paths under {} are too long for Unix sockets ({len} > {MAX_SOCKET_PATH} bytes)", dir.display()),
+                format!(
+                    "paths under {} are too long for Unix sockets ({len} > {MAX_SOCKET_PATH} bytes)",
+                    dir.display()
+                ),
                 "use a shorter VM name, or set VX_HOME to a shorter path",
             ));
         }
@@ -275,10 +277,7 @@ impl Spec {
             cpus: std::thread::available_parallelism().map_or(4, |n| n.get().min(4) as u32),
             memory: "4G".into(),
             forward: vec![],
-            ssh: SshSpec {
-                user: guest_user(&env::var("USER").unwrap_or_default()),
-                port: FIRST_SSH_PORT,
-            },
+            ssh: SshSpec { user: guest_user(&env::var("USER").unwrap_or_default()), port: FIRST_SSH_PORT },
             qemu: None,
         })
     }
@@ -333,8 +332,8 @@ pub fn validate_name(name: &str) -> Result<()> {
 
 /// Accounts cloud images already have, or that would clash with system groups.
 const TAKEN_USERS: &[&str] = &[
-    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail", "news", "uucp", "proxy",
-    "www-data", "backup", "list", "irc", "nobody", "admin", "sshd", "debian", "ubuntu", "lxd",
+    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail", "news", "uucp", "proxy", "www-data",
+    "backup", "list", "irc", "nobody", "admin", "sshd", "debian", "ubuntu", "lxd",
 ];
 
 /// Your user name, made safe for the guest: lowercased, invalid characters dropped,

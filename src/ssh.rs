@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::backend::{Backend, Check, State};
+use crate::hinted;
 use crate::host::{self, Os};
 use crate::progress::{self, Spinner};
 use crate::style::{self, ERR};
 use crate::vx::{Home, Vm};
-use crate::hinted;
 
 pub struct HostKey {
     pub private: String,
@@ -183,10 +183,7 @@ pub fn wait_cloud_init(config: &Path, vm: &Vm) -> Result<()> {
         style::warn("  ", "cloud-init couldn't set the hostname, so it's still the image's default");
         return Ok(());
     }
-    Err(hinted(
-        format!("cloud-init failed in {}", vm.name),
-        format!("vx ssh {} -- cloud-init status --long", vm.name),
-    ))
+    Err(hinted(format!("cloud-init failed in {}", vm.name), format!("vx ssh {} -- cloud-init status --long", vm.name)))
 }
 
 /// Whether `cloud-init status --format json` lists errors, all from the set_hostname module.

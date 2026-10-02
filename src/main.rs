@@ -270,7 +270,10 @@ fn ls(home: &Home) -> Result<()> {
                     // Paused, or something QEMU reported that needs a look (e.g. io-error).
                     _ => OUT.yellow(state.to_string()),
                 };
-                println!("{name:w$}  {state:8}  {:7}  {:>4}  {:>6}  127.0.0.1:{}", s.arch, s.cpus, s.memory, s.ssh.port);
+                println!(
+                    "{name:w$}  {state:8}  {:7}  {:>4}  {:>6}  127.0.0.1:{}",
+                    s.arch, s.cpus, s.memory, s.ssh.port
+                );
             }
             Err(e) => println!("{name:w$}  {} {e}", OUT.red("error:")),
         }
@@ -344,10 +347,7 @@ fn rm(vm: Vm, yes: bool) -> Result<()> {
 
 fn confirm(vm: &Vm) -> Result<bool> {
     if !io::stdin().is_terminal() {
-        return Err(hinted(
-            format!("not deleting {} without confirmation", vm.name),
-            format!("vx rm -y {}", vm.name),
-        ));
+        return Err(hinted(format!("not deleting {} without confirmation", vm.name), format!("vx rm -y {}", vm.name)));
     }
     eprint!("delete {} and its disk? {} ", ERR.bold(&vm.name), ERR.dim("[y/N]"));
     io::stderr().flush()?;
@@ -476,11 +476,7 @@ fn images(home: &Home) -> Result<()> {
     }
     println!();
     println!("{}", OUT.dim("vx new <name> --image <image> · vx images pull | add | rm | prune"));
-    let cache = format!(
-        "downloads: {} in {}",
-        progress::bytes(image::cache_size(home)),
-        home.images().display()
-    );
+    let cache = format!("downloads: {} in {}", progress::bytes(image::cache_size(home)), home.images().display());
     println!("{}", OUT.dim(cache));
     Ok(())
 }
