@@ -2,6 +2,7 @@
 #[allow(dead_code)]
 mod backend;
 mod console;
+mod copy;
 mod form;
 #[allow(dead_code)]
 mod host;
@@ -67,6 +68,17 @@ enum Command {
         /// A command to run instead of a shell
         #[arg(last = true)]
         command: Vec<String>,
+    },
+    /// Copy files or directories into or out of a VM, starting it first if needed
+    ///
+    /// The VM's side is <vm>:<path>; relative paths start in your home there.
+    ///   vx cp notes.txt src/ dev:/tmp/
+    ///   vx cp dev:project/out.log .
+    #[command(verbatim_doc_comment)]
+    Cp {
+        /// Sources, then the destination
+        #[arg(required = true, num_args = 2.., value_name = "PATH")]
+        paths: Vec<String>,
     },
     /// Attach to a VM's serial console (Ctrl-] to detach)
     Console { name: Option<String> },
@@ -246,6 +258,7 @@ fn run(cli: Cli) -> Result<()> {
                 ssh(&home, &vm, &command)?;
             }
         }
+        Command::Cp { paths } => cp(&home, &paths)?,
         Command::Console { name } => {
             if let Some(vm) = pick(name, "console", "Which VM's console?", Some(State::Running))? {
                 attach(&vm)?;
@@ -631,16 +644,38 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
 }
 
 fn ssh(home: &Home, vm: &Vm, command: &[String]) -> Result<()> {
+    let config = reachable(home, vm)?;
+    ssh::exec(&config, vm, command)
+}
+
+fn cp(home: &Home, paths: &[String]) -> Result<()> {
+    let names = home.names()?;
+    let places = paths.iter().map(|p| copy::Place::parse(p, |n| names.iter().any(|v| v == n)));
+    let plan = copy::plan(places.collect::<Result<_>>()?)?;
+    let vm = home.load(&plan.vm)?;
+    let config = reachable(home, &vm)?;
+    ssh::copy(&config, &plan.operands)
+}
+
+/// Write the VM's ssh_config and return it, starting the VM first if it's stopped.
+fn reachable(home: &Home, vm: &Vm) -> Result<PathBuf> {
     let backend = backend::get(&vm.spec.backend)?;
     let config = ssh::write_config(home, vm, backend.ssh_addr(vm))?;
-    if backend.state(vm) == State::Stopped {
-        {
-            let _lock = vm.lock()?;
-            backend.start(vm)?;
+    match backend.state(vm) {
+        State::Stopped => {
+            {
+                let _lock = vm.lock()?;
+                backend.start(vm)?;
+            }
+            ssh::wait_ready(&config, vm, backend, boot_timeout(vm))?;
         }
-        ssh::wait_ready(&config, vm, backend, boot_timeout(vm))?;
+        // A paused VM accepts the connection but never answers, so ssh would just hang.
+        State::Paused => {
+            return Err(hinted(format!("{} is paused", vm.name), format!("vx resume {}", vm.name)));
+        }
+        _ => {}
     }
-    ssh::exec(&config, vm, command)
+    Ok(config)
 }
 
 /// Emulated guests boot many times slower.

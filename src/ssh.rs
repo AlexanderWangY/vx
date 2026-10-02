@@ -119,6 +119,13 @@ pub fn reachable(config: &Path, vm: &Vm) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Replace this process with `scp`, which copies `operands` (sources, then a destination) using
+/// the VM's ssh_config. `-r` lets any of them be a directory.
+pub fn copy(config: &Path, operands: &[String]) -> Result<()> {
+    let err = Command::new("scp").arg("-F").arg(config).arg("-r").args(operands).exec();
+    Err(err).context("running scp")
+}
+
 /// Wait until the VM accepts an SSH login, showing its latest boot output meanwhile.
 pub fn wait_ready(config: &Path, vm: &Vm, backend: &dyn Backend, timeout: Duration) -> Result<()> {
     let mut spinner = Spinner::new();
