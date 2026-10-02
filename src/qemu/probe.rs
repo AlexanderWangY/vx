@@ -96,7 +96,8 @@ fn find_firmware(qemu: &Path) -> String {
         .collect();
     dirs.push("/usr/share/qemu/firmware".into());
     dirs.push("/etc/qemu/firmware".into());
-    let config = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| env::home_dir().map(|h| h.join(".config")));
+    let config =
+        env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| env::home_dir().map(|h| h.join(".config")));
     dirs.extend(config.map(|c| c.join("qemu/firmware")));
 
     let mut files = BTreeMap::new();

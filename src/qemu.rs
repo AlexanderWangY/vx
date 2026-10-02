@@ -26,7 +26,8 @@ pub struct Qemu;
 
 impl Backend for Qemu {
     fn create(&self, vm: &Vm, image: &Path, disk: &str) -> Result<()> {
-        let qemu_img = host::which("qemu-img").ok_or_else(|| hinted("qemu-img not found", probe::install_hint(Os::host())))?;
+        let qemu_img =
+            host::which("qemu-img").ok_or_else(|| hinted("qemu-img not found", probe::install_hint(Os::host())))?;
         let target = vm.path("disk.qcow2");
         let info = host::run(Command::new(&qemu_img).args(["info", "--output=json"]).arg(image))?;
         let info: Value = serde_json::from_str(&info).context("reading qemu-img info")?;
@@ -221,7 +222,6 @@ fn read_pid(vm: &Vm) -> Result<i32> {
     let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     text.trim().parse().with_context(|| format!("no pid in {}", path.display()))
 }
-
 
 /// Every QEMU argument for `vm` on `host`, after the binary. Pure, so it's golden-tested,
 /// and `vx cmd` prints it verbatim: nothing about how a VM runs is hidden.

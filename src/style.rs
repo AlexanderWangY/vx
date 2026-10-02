@@ -20,9 +20,8 @@ impl Colors {
     pub fn enabled(self) -> bool {
         static OUT_ON: OnceLock<bool> = OnceLock::new();
         static ERR_ON: OnceLock<bool> = OnceLock::new();
-        let wanted = || {
-            env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()) && env::var("TERM").map_or(true, |t| t != "dumb")
-        };
+        let wanted =
+            || env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()) && env::var("TERM").map_or(true, |t| t != "dumb");
         if self.stderr {
             *ERR_ON.get_or_init(|| wanted() && io::stderr().is_terminal())
         } else {

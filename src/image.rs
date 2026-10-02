@@ -6,8 +6,8 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File};
-use std::os::unix::fs::DirBuilderExt;
 use std::io::{Read, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -233,7 +233,10 @@ pub fn find(name: &str) -> Option<&'static Image> {
 pub enum Source {
     Catalog(&'static Image),
     /// One you added with `vx images add`.
-    Custom { name: String, path: PathBuf },
+    Custom {
+        name: String,
+        path: PathBuf,
+    },
     File(PathBuf),
 }
 
@@ -329,7 +332,10 @@ impl Image {
             Err(e) => {
                 // Offline, or the mirror is down: the newest copy we have will do.
                 if let Some(path) = self.cached(home, arch).into_iter().next() {
-                    style::warn("  ", format!("couldn't check for a newer {} ({e:#}); using the cached copy", self.name));
+                    style::warn(
+                        "  ",
+                        format!("couldn't check for a newer {} ({e:#}); using the cached copy", self.name),
+                    );
                     return Ok(path);
                 }
                 return Err(e);
@@ -490,7 +496,11 @@ pub fn add_custom(home: &Home, name: &str, file: &Path) -> Result<PathBuf> {
         return Err(hinted(format!("{} isn't a file", file.display()), "pass the path to a qcow2 or raw disk image"));
     }
     let dir = custom_dir(home);
-    DirBuilder::new().recursive(true).mode(0o700).create(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
     let part = dir.join(format!(".{name}.part"));
     let dest = dir.join(format!("{name}.img"));
     fs::copy(file, &part).with_context(|| format!("copying {}", file.display()))?;
@@ -552,8 +562,11 @@ pub fn infos(home: &Home, arch: Arch) -> Vec<Info> {
         .iter()
         .map(|image| {
             let prefix = format!("{}-{arch}-", image.name);
-            let mine = files.iter().filter(|(p, _)| p.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.starts_with(&prefix)));
-            let on_disk = mine.clone().filter(|(p, _)| p.extension() == Some(OsStr::new("qcow2"))).map(|(_, m)| m.len()).sum();
+            let mine = files
+                .iter()
+                .filter(|(p, _)| p.file_name().and_then(|f| f.to_str()).is_some_and(|f| f.starts_with(&prefix)));
+            let on_disk =
+                mine.clone().filter(|(p, _)| p.extension() == Some(OsStr::new("qcow2"))).map(|(_, m)| m.len()).sum();
             // A .part that stopped growing is a download that was interrupted, not one in progress.
             let downloading = mine
                 .filter(|(p, m)| {
@@ -728,9 +741,8 @@ mod tests {
     #[test]
     fn parses_gnu_sums() {
         let sha512 = "a".repeat(128);
-        let text = format!(
-            "{SHA256}  debian-13-genericcloud-amd64.json\n{sha512}  debian-13-genericcloud-arm64.qcow2\n"
-        );
+        let text =
+            format!("{SHA256}  debian-13-genericcloud-amd64.json\n{sha512}  debian-13-genericcloud-arm64.qcow2\n");
         let found = sum(&text, "debian-13-genericcloud-arm64.qcow2").unwrap();
         assert_eq!(found, Checksum { alg: Alg::Sha512, hex: sha512 });
     }
@@ -784,7 +796,11 @@ mod tests {
             <a href="/pub/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2">z</a>"#;
         assert_eq!(
             hrefs(apache),
-            ["Fedora-Cloud-44-1.7-aarch64-CHECKSUM", "Leap-16.0.qcow2", "Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"]
+            [
+                "Fedora-Cloud-44-1.7-aarch64-CHECKSUM",
+                "Leap-16.0.qcow2",
+                "Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"
+            ]
         );
         let found = newest(hrefs(apache), "Fedora-Cloud-44-*-aarch64-CHECKSUM");
         assert_eq!(found.as_deref(), Some("Fedora-Cloud-44-1.7-aarch64-CHECKSUM"));
@@ -827,7 +843,11 @@ mod tests {
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let home = Home::at(std::env::temp_dir().join(format!("vx-image-{}-{n}", std::process::id())));
         home.init().unwrap();
-        for file in ["debian-13-aarch64-aaaaaaaaaaaa.qcow2", "debian-13-x86_64-bbbbbbbbbbbb.qcow2", "debian-12-aarch64-cccccccccccc.qcow2"] {
+        for file in [
+            "debian-13-aarch64-aaaaaaaaaaaa.qcow2",
+            "debian-13-x86_64-bbbbbbbbbbbb.qcow2",
+            "debian-12-aarch64-cccccccccccc.qcow2",
+        ] {
             fs::write(home.images().join(file), vec![0; 1000]).unwrap();
         }
         home
@@ -895,7 +915,9 @@ mod tests {
                     Ok((url, sum, mb.unwrap_or(0) / 1_000_000))
                 });
                 match result {
-                    Ok((url, sum, mb)) => println!("ok   {:20} {arch:8} {mb:>5} MB  {:?} {}…  {url}", image.name, sum.alg, &sum.hex[..12]),
+                    Ok((url, sum, mb)) => {
+                        println!("ok   {:20} {arch:8} {mb:>5} MB  {:?} {}…  {url}", image.name, sum.alg, &sum.hex[..12])
+                    }
                     Err(e) => failures.push(format!("{} {arch}: {e:#}", image.name)),
                 }
             }
