@@ -7,6 +7,7 @@ mod form;
 #[allow(dead_code)]
 mod host;
 mod image;
+mod ports;
 mod progress;
 #[allow(dead_code)]
 mod qemu;
@@ -96,12 +97,42 @@ enum Command {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Forward ports on this machine into a VM, or list them
+    ///
+    ///   vx port dev              list them
+    ///   vx port dev 8080:80      localhost:8080 here reaches port 80 in dev
+    ///   vx port dev 3000         the same port on both sides
+    ///   vx port rm dev 8080      stop forwarding it
+    #[command(verbatim_doc_comment)]
+    Port(PortArgs),
     /// Save a VM as it is now, to go back to later (`vx snap ls` shows them)
     Snap(SnapArgs),
     /// List the images `vx new` can use, or manage them
     Images {
         #[command(subcommand)]
         action: Option<ImagesCommand>,
+    },
+}
+
+#[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct PortArgs {
+    #[command(subcommand)]
+    action: Option<PortCommand>,
+    /// The VM (leave it out to pick one)
+    vm: Option<String>,
+    /// Forwards to add, as <port here>:<port in the VM>, or one port for both; none lists them
+    #[arg(value_name = "PORTS")]
+    ports: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum PortCommand {
+    /// Stop forwarding ports, by their number on this machine
+    Rm {
+        vm: String,
+        #[arg(required = true)]
+        ports: Vec<u16>,
     },
 }
 
@@ -273,6 +304,19 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(vm) = pick(name, "rm", "Which VM do you want to delete?", None)? {
                 rm(vm, yes)?;
             }
+        }
+        Command::Port(PortArgs { action: None, vm, ports }) => {
+            if let Some(mut vm) = pick(vm, "port", "Which VM's ports?", None)? {
+                if ports.is_empty() {
+                    ports::list(&vm)?;
+                } else {
+                    let forwards = ports.iter().map(|p| ports::parse(p)).collect::<Result<Vec<_>>>()?;
+                    ports::add(&home, &mut vm, &forwards)?;
+                }
+            }
+        }
+        Command::Port(PortArgs { action: Some(PortCommand::Rm { vm, ports }), .. }) => {
+            ports::remove(&mut home.load(&vm)?, &ports)?;
         }
         Command::Snap(SnapArgs { action: None, vm, name, message }) => {
             if let Some(vm) = pick(vm, "snap", "Which VM do you want to snapshot?", None)? {

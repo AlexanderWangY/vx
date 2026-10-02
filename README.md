@@ -47,6 +47,7 @@ vx ls
 vx start | stop | pause | resume <vm>
 vx ssh <vm> [-- cmd]            # starts it first if needed
 vx cp <path>... <vm>:<path>     # copy in; or <vm>:<path>... <path> to copy out
+vx port <vm> [8080:80 | 3000]   # forward ports to it, or list them; vx port rm <vm> 8080
 vx console <vm>                 # serial console, Ctrl-] to detach
 vx logs -f <vm>
 vx snap <vm> [name]             # see Snapshots below
@@ -93,6 +94,6 @@ vx new dev --image mybox
 - `vx ssh dev -- uname -a` runs one command.
 - `vx cp ./src dev:` copies a whole directory into your home in the VM; `vx cp dev:build/app.log .` brings a file back. A path on the VM's side is relative to your home there.
 - Put `Include ~/.vx/vms/*/ssh_config` at the top of `~/.ssh/config`, then `ssh dev.vx`, `scp` and `rsync` just work.
-- Forward ports: add `forward = ["8080:80"]` above `[ssh]` in `~/.vx/vms/dev/vx.toml`. Applies on next start.
+- `vx port dev 8080:80` makes `localhost:8080` reach port 80 in `dev`, straight away if it's running and every time it starts. Forwards listen on 127.0.0.1 only, so nothing else on your network can reach them. In the dashboard, `f` shows and changes them.
 - `vx images pull ubuntu-24.04` downloads ahead of time.
 - `VX_HOME=/somewhere/else` keeps everything somewhere else.
