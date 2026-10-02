@@ -32,7 +32,7 @@ Run `vx` with no arguments.
 
 ![VMs](assets/dashboard_ss.jpg)
 
-`⏎` ssh · `s` start · `x` stop · `p` pause · `n` new · `d` delete · `tab` images · `?` all keys
+`⏎` ssh · `s` start · `x` stop · `p` pause · `n` new · `d` delete · `t` snapshots · `tab` images · `?` all keys
 
 On a terminal at least 120 columns wide, the selected VM's details sit on the right: live CPU (overall and per core), memory, swap, disk and network from inside the guest, read over SSH with nothing to install. `i` hides or shows them.
 
@@ -48,10 +48,32 @@ vx start | stop | pause | resume <vm>
 vx ssh <vm> [-- cmd]            # starts it first if needed
 vx console <vm>                 # serial console, Ctrl-] to detach
 vx logs -f <vm>
+vx snap <vm> [name]             # see Snapshots below
 vx rm <vm>
 ```
 
 Leave out the VM name and you get a picker.
+
+## Snapshots
+
+```
+vx snap dev before-upgrade -m "known good"   # save it as it is now
+vx snap ls dev                               # the history, as a tree
+vx snap restore dev before-upgrade           # go back
+vx snap rm dev before-upgrade
+```
+
+A running VM's memory is saved too, so restoring puts it back exactly where it was, processes and all. Restore an older snapshot and save again, and you've started a branch. `vx snap ls` keeps the line to where the VM is now straight down the left, with everything else branching off it:
+
+```
+○ fresh       2d ago                    first boot
+● deps        2d ago  +545 MB memory    toolchains
+├─● try-nix   1d ago  +547 MB memory
+● k8s         5h ago  +547 MB memory    kind cluster up
+◉ now         running
+```
+
+In the dashboard, `t` opens the selected VM's tree: `c` saves, `⏎` restores, `space` unfolds a branch. Snapshots live inside the VM's disk, so `vx rm` takes them with it.
 
 ## Images
 

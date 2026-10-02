@@ -108,6 +108,17 @@ pub fn exec(config: &Path, vm: &Vm, command: &[String]) -> Result<()> {
     Err(err).context("running ssh")
 }
 
+/// Whether the VM accepts an SSH login right now.
+pub fn reachable(config: &Path, vm: &Vm) -> bool {
+    ssh(config, vm)
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=2", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Wait until the VM accepts an SSH login, showing its latest boot output meanwhile.
 pub fn wait_ready(config: &Path, vm: &Vm, backend: &dyn Backend, timeout: Duration) -> Result<()> {
     let mut spinner = Spinner::new();

@@ -8,10 +8,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
-use anyhow::{Context, Result, ensure};
-use serde_json::Value;
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::{Value, json};
 
-use crate::backend::{Backend, Check, CommandLine, Console, Pause, State};
+use crate::backend::{Backend, Check, CommandLine, Console, Pause, Snap, Snapshots, State};
 use crate::host::{self, Arch, Os};
 use crate::style::{self, ERR};
 use crate::vx::Vm;
@@ -22,63 +22,29 @@ use probe::Host;
 const POWERDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long QEMU gets to exit after `quit` or SIGKILL.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Holds the pid of a QEMU started with what saving memory needs.
+const LIVE: &str = "qemu.live";
 
 pub struct Qemu;
 
 impl Backend for Qemu {
     fn create(&self, vm: &Vm, image: &Path, disk: &str) -> Result<()> {
-        let qemu_img =
-            host::which("qemu-img").ok_or_else(|| hinted("qemu-img not found", probe::install_hint(Os::host())))?;
         let target = vm.path("disk.qcow2");
-        let info = host::run(Command::new(&qemu_img).args(["info", "--output=json"]).arg(image))?;
+        let info = host::run(qemu_img()?.args(["info", "--output=json"]).arg(image))?;
         let info: Value = serde_json::from_str(&info).context("reading qemu-img info")?;
         if info["format"] == "qcow2" {
             // A copy-on-write clone on APFS, btrfs and XFS, so it's instant and takes no space.
             fs::copy(image, &target).with_context(|| format!("copying {}", image.display()))?;
         } else {
-            host::run(Command::new(&qemu_img).args(["convert", "-O", "qcow2"]).arg(image).arg(&target))?;
+            host::run(qemu_img()?.args(["convert", "-O", "qcow2"]).arg(image).arg(&target))?;
         }
         // The guest's cloud-init grows its root filesystem to fill the disk on first boot.
-        host::run(Command::new(&qemu_img).args(["resize", "-q"]).arg(&target).arg(disk))?;
+        host::run(qemu_img()?.args(["resize", "-q"]).arg(&target).arg(disk))?;
         Ok(())
     }
 
     fn start(&self, vm: &Vm) -> Result<()> {
-        let host = Host::probe(vm.spec.arch)?;
-        match (&host.accel, vm.spec.arch == host.arch) {
-            (Ok(_), true) => {}
-            (Err(why), true) => {
-                style::warn("", why);
-                style::warn("", format!("{} will run emulated, which is much slower", vm.name));
-            }
-            (_, false) => style::warn(
-                "",
-                format!(
-                    "{} is an {} VM on an {} host, so it will run emulated, which is much slower",
-                    vm.name, vm.spec.arch, host.arch
-                ),
-            ),
-        }
-
-        // With -daemonize, QEMU exits once the VM is set up and its sockets are listening.
-        let out = Command::new(&host.qemu)
-            .args(argv(vm, &host))
-            .stdin(Stdio::null())
-            .output()
-            .with_context(|| format!("running {}", host.qemu.display()))?;
-        if out.status.success() {
-            return Ok(());
-        }
-
-        let log_path = vm.path("qemu.log");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let log = fs::read_to_string(&log_path).unwrap_or_default();
-        let why = last_line(&stderr).or_else(|| last_line(&log)).unwrap_or("no error output");
-        let hint = match start_hint(&format!("{stderr}\n{log}")) {
-            Some(hint) => hint.to_string(),
-            None => format!("QEMU's log is in {}", log_path.display()),
-        };
-        Err(hinted(format!("QEMU could not start {}: {why}", vm.name), hint))
+        self.launch(vm, None)
     }
 
     fn stop(&self, vm: &Vm, force: bool) -> Result<()> {
@@ -141,9 +107,63 @@ impl Backend for Qemu {
     fn command_line(&self) -> Option<&dyn CommandLine> {
         Some(self)
     }
+
+    fn snapshots(&self) -> Option<&dyn Snapshots> {
+        Some(self)
+    }
 }
 
 impl Qemu {
+    /// Start QEMU, booting fresh or, with `loadvm`, straight into that snapshot.
+    fn launch(&self, vm: &Vm, loadvm: Option<&str>) -> Result<()> {
+        let host = Host::probe(vm.spec.arch)?;
+        match (&host.accel, vm.spec.arch == host.arch) {
+            (Ok(_), true) => {}
+            (Err(why), true) => {
+                style::warn("", why);
+                style::warn("", format!("{} will run emulated, which is much slower", vm.name));
+            }
+            (_, false) => style::warn(
+                "",
+                format!(
+                    "{} is an {} VM on an {} host, so it will run emulated, which is much slower",
+                    vm.name, vm.spec.arch, host.arch
+                ),
+            ),
+        }
+
+        let mut args = argv(vm, &host);
+        if let Some(name) = loadvm {
+            args.extend(["-loadvm".into(), name.into()]);
+        }
+        // With -daemonize, QEMU exits once the VM is set up and its sockets are listening.
+        let out = Command::new(&host.qemu)
+            .args(args)
+            // Saving a VM's memory on macOS runs Objective-C code in Hypervisor.framework for
+            // the first time in QEMU's -daemonize child, which the runtime aborts after fork.
+            .env("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("running {}", host.qemu.display()))?;
+        if out.status.success() {
+            // Marks this QEMU as one that can save memory; see `saves_memory`.
+            if let Ok(pid) = read_pid(vm) {
+                let _ = fs::write(vm.path(LIVE), pid.to_string());
+            }
+            return Ok(());
+        }
+
+        let log_path = vm.path("qemu.log");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let log = fs::read_to_string(&log_path).unwrap_or_default();
+        let why = last_line(&stderr).or_else(|| last_line(&log)).unwrap_or("no error output");
+        let hint = match start_hint(&format!("{stderr}\n{log}")) {
+            Some(hint) => hint.to_string(),
+            None => format!("QEMU's log is in {}", log_path.display()),
+        };
+        Err(hinted(format!("QEMU could not start {}: {why}", vm.name), hint))
+    }
+
     fn wait_until_stopped(&self, vm: &Vm, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -171,6 +191,151 @@ impl Console for Qemu {
         let sock = vm.path("serial.sock");
         UnixStream::connect(&sock).with_context(|| format!("connecting to {}", sock.display()))
     }
+}
+
+/// Snapshots live inside disk.qcow2: `qemu-img snapshot` while the VM is stopped, and QMP while
+/// QEMU has the disk open.
+impl Snapshots for Qemu {
+    fn list(&self, vm: &Vm) -> Result<Vec<Snap>> {
+        let list = match self.state(vm) {
+            State::Stopped => {
+                // -U: a read that doesn't wait on a `qemu-img snapshot` holding the disk's lock.
+                let info = host::run(qemu_img()?.args(["info", "-U", "--output=json"]).arg(vm.path("disk.qcow2")))?;
+                let mut info: Value = serde_json::from_str(&info).context("reading qemu-img info")?;
+                info["snapshots"].take()
+            }
+            _ => disk_node(vm)?["image"]["snapshots"].take(),
+        };
+        let mut snaps = snaps_from(&list);
+        snaps.sort_by_key(|s| s.created);
+        Ok(snaps)
+    }
+
+    fn save(&self, vm: &Vm, name: &str, memory: bool) -> Result<Snap> {
+        let sock = vm.path("qmp.sock");
+        match self.state(vm) {
+            State::Stopped => {
+                host::run(qemu_img()?.args(["snapshot", "-c", name]).arg(vm.path("disk.qcow2")))?;
+            }
+            State::Other(state) => bail!("{} is {state}", vm.name),
+            state if memory && saves_memory(vm) => {
+                let node = node_name(vm)?;
+                if state == State::Running {
+                    eprintln!("{}", ERR.dim(format!("saving {}'s memory and disk…", vm.name)));
+                }
+                qmp::job(&sock, "snapshot-save", json!({ "tag": name, "vmstate": node, "devices": [node] }))?;
+            }
+            state => {
+                if memory {
+                    style::warn(
+                        "",
+                        format!(
+                            "{0} was started by an older vx, so only its disk is saved; \
+                             restart it once (`vx stop {0}`, `vx start {0}`) to save its memory too",
+                            vm.name
+                        ),
+                    );
+                }
+                // Paused, so the disk is saved at one instant rather than mid-write.
+                let node = node_name(vm)?;
+                let running = state == State::Running;
+                if running {
+                    qmp::call(&sock, "stop")?;
+                }
+                let saved =
+                    qmp::call_with(&sock, "blockdev-snapshot-internal-sync", json!({ "device": node, "name": name }));
+                if running {
+                    qmp::call(&sock, "cont")?;
+                }
+                saved?;
+            }
+        }
+        self.list(vm)?
+            .into_iter()
+            .find(|s| s.name == name)
+            .with_context(|| format!("QEMU didn't save snapshot `{name}`"))
+    }
+
+    fn restore(&self, vm: &Vm, snap: &Snap) -> Result<()> {
+        let state = self.state(vm);
+        let up = state != State::Stopped;
+        if snap.memory > 0 {
+            if up && saves_memory(vm) {
+                let node = node_name(vm)?;
+                return qmp::job(
+                    &vm.path("qmp.sock"),
+                    "snapshot-load",
+                    json!({ "tag": snap.name, "vmstate": node, "devices": [node] }),
+                );
+            }
+            // What it's doing now is about to be replaced, so there's nothing to shut down.
+            if up {
+                self.stop(vm, true)?;
+            }
+            return self.launch(vm, Some(&snap.name));
+        }
+        if up {
+            self.stop(vm, true)?;
+        }
+        host::run(qemu_img()?.args(["snapshot", "-a", &snap.name]).arg(vm.path("disk.qcow2")))?;
+        if up { self.launch(vm, None) } else { Ok(()) }
+    }
+
+    fn delete(&self, vm: &Vm, name: &str) -> Result<()> {
+        match self.state(vm) {
+            State::Stopped => {
+                host::run(qemu_img()?.args(["snapshot", "-d", name]).arg(vm.path("disk.qcow2")))?;
+                Ok(())
+            }
+            _ => qmp::job(&vm.path("qmp.sock"), "snapshot-delete", json!({ "tag": name, "devices": [node_name(vm)?] })),
+        }
+    }
+}
+
+fn qemu_img() -> Result<Command> {
+    let path = host::which("qemu-img").ok_or_else(|| hinted("qemu-img not found", probe::install_hint(Os::host())))?;
+    Ok(Command::new(path))
+}
+
+/// The running QEMU's view of the VM's disk, from `query-block`.
+fn disk_node(vm: &Vm) -> Result<Value> {
+    let disk = vm.path("disk.qcow2");
+    let mut blocks = qmp::call(&vm.path("qmp.sock"), "query-block")?;
+    let found = blocks.as_array_mut().into_iter().flatten().find_map(|b| {
+        let inserted = b["inserted"].take();
+        (inserted["file"].as_str() == disk.to_str()).then_some(inserted)
+    });
+    found.with_context(|| format!("QEMU doesn't have {} open", disk.display()))
+}
+
+fn node_name(vm: &Vm) -> Result<String> {
+    let node = disk_node(vm)?;
+    node["node-name"].as_str().map(String::from).context("QEMU didn't name the disk's block node")
+}
+
+/// Whether this VM's QEMU can save its memory without crashing: on macOS, only one started
+/// with the environment `launch` sets, which an older vx didn't.
+fn saves_memory(vm: &Vm) -> bool {
+    if Os::host() == Os::Linux {
+        return true;
+    }
+    let marked = fs::read_to_string(vm.path(LIVE)).ok().and_then(|pid| pid.trim().parse().ok());
+    marked.is_some() && marked == read_pid(vm).ok()
+}
+
+/// The `snapshots` list from `qemu-img info` or `query-block`; both use the same fields.
+fn snaps_from(list: &Value) -> Vec<Snap> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            Some(Snap {
+                name: s["name"].as_str()?.to_string(),
+                created: s["date-sec"].as_u64().unwrap_or(0),
+                memory: s["vm-state-size"].as_u64().unwrap_or(0),
+            })
+        })
+        .collect()
 }
 
 impl CommandLine for Qemu {
@@ -437,6 +602,23 @@ mod tests {
         vm.dir = "/Users/a,b/.vx/vms/dev".into();
         let argv = argv(&vm, &host(Os::Macos, Arch::Aarch64, Ok("hvf")));
         assert_eq!(value(&argv, "-pidfile"), Some("/Users/a,,b/.vx/vms/dev/qemu.pid"));
+    }
+
+    #[test]
+    fn snapshot_lists() {
+        let list = serde_json::json!([
+            { "id": "1", "name": "fresh", "date-sec": 1790949054u64, "vm-state-size": 0 },
+            { "id": "2", "name": "deps", "date-sec": 1790950000u64, "vm-state-size": 529571266u64 },
+            { "id": "3" },
+        ]);
+        assert_eq!(
+            snaps_from(&list),
+            [
+                Snap { name: "fresh".into(), created: 1790949054, memory: 0 },
+                Snap { name: "deps".into(), created: 1790950000, memory: 529571266 },
+            ]
+        );
+        assert!(snaps_from(&Value::Null).is_empty(), "qemu-img leaves the list out when there are none");
     }
 
     #[test]
