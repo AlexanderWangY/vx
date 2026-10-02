@@ -12,6 +12,7 @@ mod qemu;
 mod qmp;
 mod seed;
 mod ssh;
+mod stats;
 mod style;
 mod tui;
 #[allow(dead_code)]
@@ -261,7 +262,7 @@ fn ls(home: &Home) -> Result<()> {
     let w = names.iter().map(String::len).max().unwrap_or(0).max("NAME".len());
     let header = format!("{:w$}  {:8}  {:7}  {:>4}  {:>6}  SSH", "NAME", "STATE", "ARCH", "CPUS", "MEMORY");
     println!("{}", OUT.dim(header));
-    for tui::Entry { name, vm } in tui::entries(home)? {
+    for tui::Entry { name, vm, .. } in tui::entries(home)? {
         match vm {
             Ok((s, state)) => {
                 let state = match &state {

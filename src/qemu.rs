@@ -1,6 +1,7 @@
 mod probe;
 
 use std::net::{Ipv4Addr, SocketAddr};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -113,6 +114,11 @@ impl Backend for Qemu {
 
     fn ssh_addr(&self, vm: &Vm) -> SocketAddr {
         SocketAddr::from((Ipv4Addr::LOCALHOST, vm.spec.ssh.port))
+    }
+
+    fn disk_usage(&self, vm: &Vm) -> Option<u64> {
+        // Allocated blocks rather than the length, which is sparse or a copy-on-write clone.
+        fs::metadata(vm.path("disk.qcow2")).ok().map(|m| m.blocks() * 512)
     }
 
     fn checks(&self) -> Vec<Check> {
