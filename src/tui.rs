@@ -1,12 +1,15 @@
 //! The dashboard: `vx` with no arguments. Two views in one box, switched with Tab: a table of VMs
 //! whose state refreshes every second, and a table of images.
 //!
+//! On a wide enough terminal, the selected VM's details sit to the right of the table, with live
+//! CPU, memory, disk and network numbers from inside it while it runs (see `stats`).
+//!
 //! Actions run the CLI itself as a child process, so they share its locks, checks and messages:
 //! most in the background with their output captured, and the interactive ones (ssh, console,
 //! logs) in the foreground with the dashboard set aside until they end. Creating a VM and adding
 //! an image use forms drawn in the dashboard.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -25,6 +28,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState,
+    Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
 
@@ -34,6 +38,7 @@ use crate::form::{AddImageForm, NewForm, NewImage, Step};
 use crate::host::Arch;
 use crate::image::{self, Info};
 use crate::progress::bytes;
+use crate::stats::{Sample, Stats, Watcher};
 use crate::style::{self, ERR, OUT};
 use crate::vx::{Home, Spec};
 
@@ -59,6 +64,8 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 pub struct Entry {
     pub name: String,
     pub vm: Result<(Spec, State), String>,
+    /// Bytes its disk takes up on the host, if the backend knows.
+    pub disk: Option<u64>,
 }
 
 /// Every VM, sorted by name, with its state asked of its backend.
@@ -67,14 +74,18 @@ pub fn entries(home: &Home) -> Result<Vec<Entry>> {
         .names()?
         .into_iter()
         .map(|name| {
+            let mut disk = None;
             let vm = home.load(&name).map_err(|e| format!("{e:#}")).map(|vm| {
                 let state = match backend::get(&vm.spec.backend) {
-                    Ok(b) => b.state(&vm),
+                    Ok(b) => {
+                        disk = b.disk_usage(&vm);
+                        b.state(&vm)
+                    }
                     Err(_) => State::Other(format!("unknown backend `{}`", vm.spec.backend)),
                 };
                 (vm.spec, state)
             });
-            Entry { name, vm }
+            Entry { name, vm, disk }
         })
         .collect())
 }
@@ -84,6 +95,11 @@ enum Msg {
     Snapshot {
         vms: Result<Vec<Entry>, String>,
         images: Vec<Info>,
+    },
+    /// A new reading from inside a running VM.
+    Stats {
+        name: String,
+        sample: Sample,
     },
     /// A background job finished.
     Done {
@@ -326,6 +342,12 @@ struct App {
     follow: Option<String>,
     /// Advances every tick, for the spinners.
     tick: usize,
+    /// Live numbers from inside running VMs, by name.
+    stats: HashMap<String, Stats>,
+    /// Whether to show the details pane when there's room; `i` toggles it.
+    details: bool,
+    /// Whether the last frame had room for it.
+    pane: bool,
 }
 
 impl App {
@@ -344,10 +366,15 @@ impl App {
             modal: None,
             follow: None,
             tick: 0,
+            stats: HashMap::new(),
+            details: true,
+            pane: false,
         }
     }
 
     fn run(mut self, terminal: &mut DefaultTerminal, io: &Io) -> Result<()> {
+        // Samples the VM whose details are showing; dropping it ends its ssh session.
+        let mut watcher: Option<Watcher> = None;
         loop {
             while let Ok(msg) = io.rx.try_recv() {
                 self.handle(msg, io);
@@ -359,6 +386,15 @@ impl App {
                     style::strip_colors(frame.buffer_mut());
                 }
             })?;
+            let watch = self.watch();
+            if watcher.as_ref().map(Watcher::name) != watch {
+                watcher = watch.map(|name| {
+                    let (tx, name) = (io.tx.clone(), name.to_string());
+                    Watcher::start(&io.home, name.clone(), move |sample| {
+                        tx.send(Msg::Stats { name: name.clone(), sample }).is_ok()
+                    })
+                });
+            }
             // Wake up regularly so refreshes and spinners move without key presses.
             if !event::poll(TICK)? {
                 continue;
@@ -389,6 +425,7 @@ impl App {
                 self.error = Some(e);
                 self.update_images(images);
             }
+            Msg::Stats { name, sample } => self.stats.entry(name).or_default().push(sample),
             Msg::Done { target, verb, result } => {
                 let name = target.name();
                 match result {
@@ -413,6 +450,8 @@ impl App {
         let index = wanted.and_then(|name| vms.iter().position(|e| e.name == name));
         self.table.select(keep_in_range(index, self.table.selected(), vms.len()));
         self.busy.retain(|_, busy| !busy.done);
+        // Numbers from a VM that stopped are stale, and its next boot starts over.
+        self.stats.retain(|name, _| vms.iter().any(|e| &e.name == name && matches!(e.vm, Ok((_, State::Running)))));
         self.vms = Some(vms);
         self.error = None;
     }
@@ -426,6 +465,17 @@ impl App {
 
     fn selected(&self) -> Option<&Entry> {
         self.vms.as_ref()?.get(self.table.selected()?)
+    }
+
+    /// The VM to sample: the one in the details pane, while it runs and nothing else is
+    /// happening to it.
+    fn watch(&self) -> Option<&str> {
+        if !self.pane || self.view != View::Vms {
+            return None;
+        }
+        let entry = self.selected()?;
+        let running = matches!(entry.vm, Ok((_, State::Running)));
+        (running && !self.busy.contains_key(&Target::Vm(entry.name.clone()))).then_some(entry.name.as_str())
     }
 
     fn selected_image(&self) -> Option<&Info> {
@@ -571,6 +621,12 @@ impl App {
         }
         match key.code {
             KeyCode::Char('n') => self.open_new(None),
+            KeyCode::Char('i') => {
+                self.details = !self.details;
+                if self.details && !self.pane {
+                    self.say(format!("details need a terminal at least {PANE_MIN_WIDTH} columns wide"), DIM);
+                }
+            }
             KeyCode::Enter => {
                 if let Some((name, _)) = self.target() {
                     return Action::Run(Foreground::Ssh(name));
@@ -677,6 +733,20 @@ impl App {
         let body = inner.inner(Margin { horizontal: 1, vertical: 0 });
 
         let spinner = SPINNER[self.tick % SPINNER.len()];
+        // The selected VM's details on the right, when there's room for both.
+        self.pane = self.details
+            && self.view == View::Vms
+            && body.width >= PANE_MIN_WIDTH - 4
+            && self.vms.as_ref().is_some_and(|vms| !vms.is_empty());
+        let (body, gap) = if self.pane {
+            let width = (body.width * 2 / 5).clamp(40, 64);
+            let [table, gap, pane] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(2), Constraint::Length(width)]).areas(body);
+            self.draw_details(frame, pane, spinner);
+            (table, Some(gap))
+        } else {
+            (body, None)
+        };
         let rows = match self.view {
             View::Vms => match &self.vms {
                 None => {
@@ -715,7 +785,9 @@ impl App {
                 .thumb_symbol("┃")
                 .track_style(BORDER)
                 .thumb_style(Style::new().fg(Color::Cyan));
-            let track = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..area };
+            // On the box's edge, or between the table and the details.
+            let edge = gap.map_or(area, |gap| Rect { width: 1, ..gap });
+            let track = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..edge };
             frame.render_stateful_widget(bar, track, &mut scroll);
         }
 
@@ -887,6 +959,124 @@ impl App {
         }
         let image = busy.pending.as_ref().map(|p| p.image.as_str()).unwrap_or_default();
         Some(self.download_progress(image).unwrap_or_else(|| "creating".into()))
+    }
+
+    /// The selected VM in its own box: what it is, and live numbers from inside it while it runs.
+    fn draw_details(&self, frame: &mut Frame, area: Rect, spinner: char) {
+        let Some(entry) = self.selected() else { return };
+        let title = Line::from(vec![
+            Span::styled("─ ", BORDER),
+            Span::styled(clip(&entry.name, area.width.saturating_sub(6) as usize), ACCENT),
+            Span::raw(" "),
+        ]);
+        let block = Block::bordered().border_type(BorderType::Rounded).border_style(BORDER).title(title);
+        let inner = block.inner(area).inner(Margin { horizontal: 1, vertical: 0 });
+        frame.render_widget(block, area);
+        let (spec, state) = match &entry.vm {
+            Ok(vm) => vm,
+            Err(e) => {
+                let text = vec![Line::styled("✗ broken", ERROR), Line::default(), Line::styled(e.clone(), DIM)];
+                frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
+                return;
+            }
+        };
+        let width = inner.width as usize;
+        let stats = self.stats.get(&entry.name).filter(|_| *state == State::Running);
+        let busy = self.vm_busy_label(&entry.name);
+        let lines = |cpu_rows: usize, net_rows: usize| {
+            let mut lines = Vec::new();
+            let mut first = vec![];
+            match &busy {
+                Some(label) => first.push(Span::styled(format!("{spinner} {label}"), BUSY)),
+                None => first.extend(state_line(state).spans),
+            }
+            if let Some(stats) = stats {
+                first.push(Span::styled(format!(" · up {}", uptime(stats.latest.uptime)), DIM));
+            }
+            lines.push(Line::from(first));
+            let about = format!("{} · {} · {} CPUs · {}", spec.image, spec.arch, spec.cpus, spec.memory);
+            lines.push(Line::styled(clip(&about, width), DIM));
+            lines.push(Line::default());
+            let field = |key: &str, value: String| {
+                Line::from(vec![Span::styled(format!("{key:6}"), DIM), Span::raw(clip(&value, width - 6))])
+            };
+            lines.push(field("ssh", format!("127.0.0.1:{}", spec.ssh.port)));
+            if !spec.forward.is_empty() {
+                let ports: Vec<String> = spec.forward.iter().map(|f| f.replacen(':', " → ", 1)).collect();
+                lines.push(field("ports", ports.join(", ")));
+            }
+            if let Some(disk) = entry.disk {
+                lines.push(field("file", format!("{} on host", bytes(disk))));
+            }
+            lines.push(Line::default());
+            let Some(stats) = stats else {
+                let why = match state {
+                    _ if busy.is_some() => String::new(),
+                    State::Running => format!("{spinner} connecting…"),
+                    State::Stopped => "live numbers show while it runs".into(),
+                    State::Paused => "paused · p resumes it".into(),
+                    State::Other(_) => String::new(),
+                };
+                lines.push(Line::styled(why, DIM));
+                return lines;
+            };
+            let s = &stats.latest;
+            lines.push(heading("CPU", format!("{:.0}%", stats.cpu * 100.0), width));
+            lines.extend(graph(&stats.cpu_history, 1.0, width, cpu_rows, heat));
+            // Cores two to a line, when they fit.
+            let columns = if width >= 36 { 2 } else { 1 };
+            let column = (width + 2) / columns - 2;
+            for chunk in stats.cores.chunks(columns).enumerate() {
+                let (row, cores) = chunk;
+                let mut spans = Vec::new();
+                for (i, usage) in cores.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw("  "));
+                    }
+                    let label = format!("{:<3}", format!("c{}", row * columns + i));
+                    spans.push(Span::styled(label, DIM));
+                    spans.extend(meter(*usage, column.saturating_sub(8)));
+                    spans.push(Span::raw(format!("{:>5}", format!("{:.0}%", usage * 100.0))));
+                }
+                lines.push(Line::from(spans));
+            }
+            let [one, five, fifteen] = s.load;
+            lines.push(Line::styled(format!("load {one:.2} {five:.2} {fifteen:.2}"), DIM));
+            lines.push(Line::default());
+
+            let mut gauges = vec![("MEM", s.mem_total.saturating_sub(s.mem_available), s.mem_total)];
+            if s.swap_total > 0 {
+                gauges.push(("SWAP", s.swap_total.saturating_sub(s.swap_free), s.swap_total));
+            }
+            gauges.push(("DISK", s.disk_used, s.disk_size));
+            let values: Vec<String> =
+                gauges.iter().map(|(_, used, total)| format!("{} / {}", amount(*used), amount(*total))).collect();
+            let value_width = values.iter().map(|v| v.chars().count()).max().unwrap_or(0);
+            for ((label, used, total), value) in gauges.into_iter().zip(values) {
+                let ratio = if total == 0 { 0.0 } else { used as f64 / total as f64 };
+                let mut spans = vec![Span::styled(format!("{label:5}"), HEADER)];
+                spans.extend(meter(ratio, width.saturating_sub(5 + 1 + value_width)));
+                spans.push(Span::raw(format!(" {value:>value_width$}")));
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::default());
+
+            // Both graphs on one scale, so they compare at a glance.
+            let peak = stats.rx_history.iter().chain(&stats.tx_history).fold(1000.0_f64, |a, b| a.max(*b));
+            for (label, rate, history, color) in [
+                ("NET ↓", stats.rx, &stats.rx_history, Color::Cyan),
+                ("NET ↑", stats.tx, &stats.tx_history, Color::Magenta),
+            ] {
+                lines.push(heading(label, format!("{}/s", amount(rate as u64)), width));
+                lines.extend(graph(history, peak, width, net_rows, |_| Style::new().fg(color)));
+            }
+            lines
+        };
+        // Graphs get the rows left over: CPU first, then up to three each for the network.
+        let spare = (inner.height as usize).saturating_sub(lines(0, 0).len());
+        let cpu_rows = (spare * 3 / 5).clamp(1.min(spare), 8);
+        let net_rows = ((spare - cpu_rows) / 2).min(3);
+        frame.render_widget(Paragraph::new(lines(cpu_rows, net_rows)), inner);
     }
 
     /// The selected row is a dark bar; its text is forced to white so it reads on light themes too.
@@ -1150,6 +1340,87 @@ fn suspend(terminal: &mut DefaultTerminal, run: impl FnOnce() -> Result<()>) -> 
     result
 }
 
+/// The narrowest terminal that shows the details pane beside the VM table.
+const PANE_MIN_WIDTH: u16 = 120;
+/// Meter cells that aren't filled.
+const EMPTY: Style = Style::new().fg(Color::Indexed(238));
+
+/// btop's colors: green while there's plenty of room, then yellow, then red.
+fn heat(level: f64) -> Style {
+    Style::new().fg(match level {
+        ..0.5 => Color::Green,
+        ..0.8 => Color::Yellow,
+        _ => Color::Red,
+    })
+}
+
+/// `label` on the left and `value` on the right of a `width`-wide line.
+fn heading(label: &str, value: String, width: usize) -> Line<'static> {
+    let pad = width.saturating_sub(label.chars().count() + value.chars().count());
+    Line::from(vec![Span::styled(label.to_string(), HEADER), Span::raw(" ".repeat(pad)), Span::raw(value)])
+}
+
+/// `■■■■■■□□□□`: `width` cells, the filled ones colored by how far along they are.
+fn meter(ratio: f64, width: usize) -> Vec<Span<'static>> {
+    let filled = (ratio.clamp(0.0, 1.0) * width as f64).round() as usize;
+    let mut spans: Vec<Span> = Vec::new();
+    for i in 0..width {
+        let style = if i < filled { heat((i as f64 + 0.5) / width as f64) } else { EMPTY };
+        match spans.last_mut() {
+            Some(last) if last.style == style => last.content.to_mut().push('■'),
+            _ => spans.push(Span::styled("■", style)),
+        }
+    }
+    spans
+}
+
+/// `rows` lines of bars, newest on the right, scaled so `max` fills them. `color` gets each
+/// row's height, from 0 at the bottom to 1 at the top.
+fn graph(
+    values: &VecDeque<f64>,
+    max: f64,
+    width: usize,
+    rows: usize,
+    color: impl Fn(f64) -> Style,
+) -> Vec<Line<'static>> {
+    const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let shown: Vec<f64> =
+        values.iter().skip(values.len().saturating_sub(width)).map(|v| (v / max).clamp(0.0, 1.0)).collect();
+    (0..rows)
+        .map(|row| {
+            let floor = (rows - 1 - row) as f64 / rows as f64;
+            let mut text = " ".repeat(width - shown.len());
+            for v in &shown {
+                let level = ((v - floor) * rows as f64).clamp(0.0, 1.0);
+                // Anything above zero shows on the bottom row, so a quiet VM isn't a blank graph.
+                let index = if row == rows - 1 && *v > 0.0 {
+                    ((level * 8.0).round() as usize).max(1)
+                } else {
+                    (level * 8.0).round() as usize
+                };
+                text.push(BARS[index]);
+            }
+            Line::styled(text, color((rows - row) as f64 / rows as f64 - 0.01))
+        })
+        .collect()
+}
+
+/// Like `bytes`, but small amounts don't round to `0 kB`.
+fn amount(n: u64) -> String {
+    if n < 1000 { format!("{n} B") } else { bytes(n) }
+}
+
+/// `2h 13m`
+fn uptime(seconds: f64) -> String {
+    let s = seconds as u64;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        3600..86400 => format!("{}h {}m", s / 3600, s % 3600 / 60),
+        _ => format!("{}d {}h", s / 86400, s % 86400 / 3600),
+    }
+}
+
 /// Columns wider than this end in `…`, so one long name can't push the rest off screen.
 const NAME_MAX: usize = 24;
 const IMAGE_MAX: usize = 18;
@@ -1201,6 +1472,7 @@ const HELP: &[(&str, &str)] = &[
     ("p", "pause or resume"),
     ("n", "new VM"),
     ("d", "delete"),
+    ("i", "show or hide details"),
     ("", ""),
     ("", "images"),
     ("⏎", "new VM from it"),
@@ -1261,7 +1533,7 @@ mod tests {
             ssh: SshSpec { user: "me".into(), port },
             qemu: None,
         };
-        Entry { name: name.into(), vm: Ok((spec, state)) }
+        Entry { name: name.into(), vm: Ok((spec, state)), disk: Some(3_100_000_000) }
     }
 
     fn info(name: &str, on_disk: u64, custom: bool, native: bool) -> Info {
@@ -1300,7 +1572,7 @@ mod tests {
         vec![
             entry("dev", State::Running, "debian-13", 2222),
             entry("web", State::Stopped, "fedora-44", 2223),
-            Entry { name: "old".into(), vm: Err("invalid vx.toml".into()) },
+            Entry { name: "old".into(), vm: Err("invalid vx.toml".into()), disk: None },
         ]
     }
 
@@ -1602,6 +1874,76 @@ mod tests {
         let text = screen(&mut app, 72, 9);
         assert!(text.contains("vm-11"), "the selection scrolls into view:\n{text}");
         assert!(text.contains('┃'), "{text}");
+    }
+
+    /// The `i`th sample, two seconds after the one before, busier each time.
+    fn sample(i: u64) -> Sample {
+        let busy = i * i * 5;
+        Sample {
+            cpus: vec![
+                (busy * 4, i * 800),
+                (busy, i * 200),
+                (busy / 2, i * 200),
+                (busy * 2 / 3, i * 200),
+                (busy / 3, i * 200),
+            ],
+            mem_total: 4_000_000_000,
+            mem_available: 2_800_000_000,
+            swap_total: 0,
+            swap_free: 0,
+            disk_used: 4_200_000_000,
+            disk_size: 19_000_000_000,
+            load: [0.42, 0.31, 0.2],
+            uptime: i as f64 * 2.0,
+            net_rx: i * i * 4000,
+            net_tx: i * i * 1000,
+        }
+    }
+
+    #[test]
+    fn details_pane_shows_live_numbers_when_wide() {
+        let mut app = with_vms();
+        assert!(!screen(&mut app, 80, 7).contains("─ dev ─"), "no room at 80 columns");
+        let text = screen(&mut app, 130, 30);
+        assert!(text.contains("─ dev ─") && text.contains("connecting…"), "{text}");
+        assert_eq!(app.watch(), Some("dev"));
+
+        let mut stats = Stats::default();
+        for i in 1..20 {
+            stats.push(sample(i));
+        }
+        app.stats.insert("dev".into(), stats);
+        let text = screen(&mut app, 130, 30);
+        for want in ["● running · up 38s", "3.1 GB on host", "CPU  ", "92%", "c3", "MEM", "DISK", "NET ↓", "74 kB/s"]
+        {
+            assert!(text.contains(want), "missing {want}:\n{text}");
+        }
+        assert!(text.contains("1.2 GB / 4.0 GB") && text.contains("4.2 GB / 19.0 GB"), "{text}");
+
+        // Stopped VMs aren't sampled; `i` hides the pane.
+        let _ = app.key(press(KeyCode::Down));
+        let text = screen(&mut app, 130, 30);
+        assert!(text.contains("live numbers show while it runs"), "{text}");
+        assert_eq!(app.watch(), None);
+        let _ = app.key(press(KeyCode::Up));
+        let _ = app.key(press(KeyCode::Char('i')));
+        assert!(!screen(&mut app, 130, 30).contains("─ dev ─"));
+        assert_eq!(app.watch(), None);
+    }
+
+    #[test]
+    fn graphs_and_meters() {
+        let history: VecDeque<f64> = [0.0, 0.25, 0.5, 1.0].into();
+        let rows: Vec<String> = graph(&history, 1.0, 6, 2, heat).iter().map(|l| l.to_string()).collect();
+        assert_eq!(rows, ["     █", "   ▄██"]);
+        let cells: String = meter(0.5, 8).iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(cells, "■■■■■■■■");
+        assert_eq!(meter(0.5, 8).len(), 2, "one span for the filled cells, one for the rest");
+        assert_eq!(amount(0), "0 B");
+        assert_eq!(amount(1500), "1 kB");
+        assert_eq!(uptime(42.0), "42s");
+        assert_eq!(uptime(7980.0), "2h 13m");
+        assert_eq!(uptime(90000.0), "1d 1h");
     }
 
     #[test]

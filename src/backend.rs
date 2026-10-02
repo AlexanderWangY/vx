@@ -46,6 +46,10 @@ pub trait Backend: Sync {
     fn state(&self, vm: &Vm) -> State;
     /// Where sshd is reachable. QEMU: 127.0.0.1:<forwarded port>.
     fn ssh_addr(&self, vm: &Vm) -> SocketAddr;
+    /// Bytes the VM's disk takes up on the host, which grows as the guest writes.
+    fn disk_usage(&self, _vm: &Vm) -> Option<u64> {
+        None
+    }
     /// Host checks for `vx doctor`.
     fn checks(&self) -> Vec<Check> {
         vec![]

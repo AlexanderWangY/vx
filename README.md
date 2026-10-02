@@ -34,6 +34,8 @@ Run `vx` with no arguments.
 
 `⏎` ssh · `s` start · `x` stop · `p` pause · `n` new · `d` delete · `tab` images · `?` all keys
 
+On a terminal at least 120 columns wide, the selected VM's details sit on the right: live CPU (overall and per core), memory, swap, disk and network from inside the guest, read over SSH with nothing to install. `i` hides or shows them.
+
 ![Images](assets/images_ss.jpg)
 
 ## Commands
