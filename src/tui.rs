@@ -53,6 +53,11 @@ const SELECTED: Style = Style::new().bg(Color::Indexed(237)).add_modifier(Modifi
 const SELECTED_TEXT: Style = Style::new().fg(Color::White);
 const BUSY: Style = Style::new().fg(Color::Cyan);
 const OK: Style = Style::new().fg(Color::Green);
+/// Snapshots: one with memory, which resumes running; one of the disk alone, which boots.
+const LIVE: Style = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
+const DISK: Style = Style::new().fg(Color::LightBlue);
+/// The snapshot the VM came from: a solid label, so it shows even on the selected row.
+const HERE: Style = Style::new().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
 const WARN: Style = Style::new().fg(Color::Yellow);
 const ERROR: Style = Style::new().fg(Color::Red);
 
@@ -990,6 +995,14 @@ impl App {
         } else {
             (body, None)
         };
+        // The snapshot list's legend on the last line.
+        let body = if self.view == View::Snapshots && body.height > 4 {
+            let [list, legend] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(body);
+            frame.render_widget(Paragraph::new(snapshot_legend(&self.snap_vm)), legend);
+            list
+        } else {
+            body
+        };
         let rows = match self.view {
             View::Vms => match &self.vms {
                 None => {
@@ -1404,19 +1417,12 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, entry)| {
-                let text = if selected == Some(i) { SELECTED_TEXT } else { Style::new() };
+                // The selection is the row's own style rather than the table's highlight, which would
+                // paint over the label on the snapshot the VM came from.
+                let text = if selected == Some(i) { SELECTED.patch(SELECTED_TEXT) } else { Style::new() };
                 let here = h.current.as_deref() == Some(entry.snap.name.as_str());
-                let marker = Span::styled(
-                    format!("{} ", snapshot::marker(entry)),
-                    if here {
-                        ACCENT
-                    } else if entry.snap.memory > 0 {
-                        OK
-                    } else {
-                        DIM
-                    },
-                );
-                let name = Span::styled(clip(&entry.snap.name, 24), if here { ACCENT } else { Style::new() });
+                let marker = marker(entry);
+                let name = name_label(&entry.snap.name, 24, here);
                 let memory = match entry.snap.memory {
                     0 => Span::styled("disk", DIM),
                     n => Span::raw(bytes(n)),
@@ -1435,7 +1441,7 @@ impl App {
                     }
                 }
                 Row::new(vec![
-                    Cell::from(Line::from(vec![marker, name])),
+                    Cell::from(Line::from(vec![marker, Span::raw(" "), name])),
                     right(snapshot::ago(entry.snap.created)),
                     Cell::from(Line::from(memory).alignment(Alignment::Right)),
                     Cell::from(Line::from(note)),
@@ -1443,7 +1449,8 @@ impl App {
                 .style(text)
             })
             .collect();
-        let name_width = h.entries.iter().map(|e| e.snap.name.chars().count().min(24)).max().unwrap_or(0) + 2;
+        // The marker, a space, and the name with a space either side.
+        let name_width = h.entries.iter().map(|e| e.snap.name.chars().count().min(24)).max().unwrap_or(0) + 4;
         let widths = [
             Constraint::Length(name_width.max(8) as u16),
             Constraint::Length(8),
@@ -1453,7 +1460,7 @@ impl App {
         let header =
             Row::new(vec![Cell::from("SNAPSHOT"), right("SAVED".into()), right("MEMORY".into()), Cell::from("NOTE")])
                 .style(HEADER);
-        Table::new(rows, widths).header(header).column_spacing(2).row_highlight_style(SELECTED)
+        Table::new(rows, widths).header(header).column_spacing(2)
     }
 
     fn vm_state(&self, name: &str) -> Option<&State> {
@@ -1876,6 +1883,29 @@ fn clip(text: &str, max: usize) -> String {
     clipped
 }
 
+/// `●` for a snapshot with memory, `○` for one of the disk alone, each in its own color.
+fn marker(entry: &snapshot::Entry) -> Span<'static> {
+    let style = if entry.snap.memory > 0 { LIVE } else { DISK };
+    Span::styled(snapshot::marker(entry).to_string(), style)
+}
+
+/// A snapshot's name with a space either side, as a solid label if the VM came from it.
+fn name_label(name: &str, max: usize, here: bool) -> Span<'static> {
+    Span::styled(format!(" {} ", clip(name, max)), if here { HERE } else { Style::new() })
+}
+
+/// What the snapshot markers and the highlight mean.
+fn snapshot_legend(vm: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("●", LIVE),
+        Span::styled(" resumes running   ", DIM),
+        Span::styled("○", DISK),
+        Span::styled(" boots from disk   ", DIM),
+        Span::styled(" name ", HERE),
+        Span::styled(format!(" where {vm} came from"), DIM),
+    ])
+}
+
 /// The VM pane's snapshot section: the newest few, with the one the VM is at highlighted.
 fn recent_snapshots(h: &History, width: usize) -> Vec<Line<'static>> {
     const SHOWN: usize = 3;
@@ -1891,11 +1921,12 @@ fn recent_snapshots(h: &History, width: usize) -> Vec<Line<'static>> {
     for e in h.entries.iter().rev().take(SHOWN) {
         let here = h.current.as_deref() == Some(e.snap.name.as_str());
         let when = snapshot::ago(e.snap.created);
-        let name = clip(&e.snap.name, width.saturating_sub(when.chars().count() + 3));
-        let pad = width.saturating_sub(2 + name.chars().count() + when.chars().count());
+        let name = name_label(&e.snap.name, width.saturating_sub(when.chars().count() + 6), here);
+        let pad = width.saturating_sub(2 + name.width() + when.chars().count());
         lines.push(Line::from(vec![
-            Span::styled(format!("{} ", snapshot::marker(e)), if here { ACCENT } else { DIM }),
-            Span::styled(name, if here { ACCENT } else { Style::new() }),
+            marker(e),
+            Span::raw(" "),
+            name,
             Span::raw(" ".repeat(pad)),
             Span::styled(when, DIM),
         ]));
@@ -1980,6 +2011,8 @@ const HELP: [&[(&str, &str)]; 2] = [
         ("⏎", "go back to it"),
         ("d", "delete it"),
         ("esc", "back to VMs"),
+        ("●", "resumes running: memory saved"),
+        ("○", "boots from disk: disk only"),
         ("", ""),
         ("tab", "switch between VMs and images"),
         ("↑↓ j k", "select · g G first / last"),
@@ -2499,12 +2532,35 @@ mod tests {
         let rows: Vec<String> =
             text.lines().skip(2).take(5).map(|l| l.split_whitespace().take(2).collect::<Vec<_>>().join(" ")).collect();
         assert_eq!(rows, ["│ ○", "│ ●", "│ ○", "│ ○", "│ ○"], "one marker per row, no graph:\n{text}");
-        for want in ["○ fresh ", "● deps ", "○ try-nix ", "○ nix-2 ", "○ k8s "] {
+        for want in ["○  fresh ", "●  deps ", "○  try-nix ", "○  nix-2 ", "○  k8s "] {
             assert!(text.contains(want), "missing {want:?}:\n{text}");
         }
+        assert!(text.contains("● resumes running   ○ boots from disk    name  where dev came from"), "{text}");
+        // The colors carry the meaning: green and blue markers, and a solid label for k8s.
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let find = |text: &str| {
+            let (y, line) = (0..12)
+                .map(|y| (y, (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>()))
+                .find(|(_, l)| l.contains(text))
+                .unwrap();
+            (line[..line.find(text).unwrap()].chars().count(), y)
+        };
+        let (x, y) = find("●  deps");
+        assert_eq!(buffer[(x as u16, y)].fg, Color::Green);
+        let (x, y) = find("○  fresh");
+        assert_eq!(buffer[(x as u16, y)].fg, Color::LightBlue);
+        let (x, y) = find("○  k8s ");
+        assert_eq!(buffer[(x as u16 + 3, y)].bg, Color::Cyan, "the k of k8s");
+        assert_eq!(buffer[(x as u16 + 3, y - 1)].bg, Color::Reset, "nix-2 isn't labelled");
         // Only k8s says where it came from: it isn't the row above.
         assert!(text.contains("from deps · kind up"), "{text}");
-        assert_eq!(text.matches("from ").count(), 1, "{text}");
+        let notes: usize = ["fresh", "deps", "try-nix", "nix-2", "k8s"]
+            .iter()
+            .map(|n| text.matches(&format!("from {n}")).count())
+            .sum();
+        assert_eq!(notes, 1, "{text}");
 
         // The VM came from k8s, so that's selected to start with.
         assert_eq!(app.snap_pick().unwrap().snap.name, "k8s");
@@ -2577,8 +2633,8 @@ mod tests {
 
         let _ = app.key(press(KeyCode::Esc));
         let text = screen(&mut app, 130, 30);
-        assert!(text.contains("SNAPSHOTS") && text.contains("○ k8s") && text.contains("○ nix-2"), "{text}");
-        assert!(!text.contains("○ deps"), "only the newest three:\n{text}");
+        assert!(text.contains("SNAPSHOTS") && text.contains("○  k8s ") && text.contains("○  nix-2 "), "{text}");
+        assert!(!text.contains(" deps "), "only the newest three:\n{text}");
         assert!(text.contains("S all (2 more) · ctrl-s save one"), "{text}");
     }
 
