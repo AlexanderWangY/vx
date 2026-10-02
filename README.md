@@ -46,6 +46,7 @@ vx new                          # no name: fill in a form
 vx ls
 vx start | stop | pause | resume <vm>
 vx ssh <vm> [-- cmd]            # starts it first if needed
+vx cp <path>... <vm>:<path>     # copy in; or <vm>:<path>... <path> to copy out
 vx console <vm>                 # serial console, Ctrl-] to detach
 vx logs -f <vm>
 vx snap <vm> [name]             # see Snapshots below
@@ -90,6 +91,7 @@ vx new dev --image mybox
 ## Tricks
 
 - `vx ssh dev -- uname -a` runs one command.
+- `vx cp ./src dev:` copies a whole directory into your home in the VM; `vx cp dev:build/app.log .` brings a file back. A path on the VM's side is relative to your home there.
 - Put `Include ~/.vx/vms/*/ssh_config` at the top of `~/.ssh/config`, then `ssh dev.vx`, `scp` and `rsync` just work.
 - Forward ports: add `forward = ["8080:80"]` above `[ssh]` in `~/.vx/vms/dev/vx.toml`. Applies on next start.
 - `vx images pull ubuntu-24.04` downloads ahead of time.

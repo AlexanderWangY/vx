@@ -4,6 +4,8 @@ The Release workflow uses the section matching each version as its GitHub Releas
 
 ## Unreleased
 
+- `vx cp` copies files and directories into or out of a VM: `vx cp notes.txt src/ dev:/tmp/`, `vx cp dev:out.log .`. It starts the VM first if it's stopped.
+
 ## 0.2.0
 
 - **Snapshots.** `vx snap <vm> [name] [-m note]` saves a VM as it is; `vx snap ls`, `vx snap restore` and `vx snap rm` list, go back to and delete them. A running VM's memory is saved too, so going back resumes it exactly where it was. Snapshots are independent save slots: going back to one or deleting one never touches the others.
