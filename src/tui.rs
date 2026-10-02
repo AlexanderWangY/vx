@@ -40,6 +40,7 @@ use crate::form::{AddImageForm, NewForm, NewImage, NewSnap, PortChange, PortsFor
 use crate::host::Arch;
 use crate::image::{self, Info};
 use crate::progress::bytes;
+use crate::setup;
 use crate::snapshot::{self, History};
 use crate::stats::{Sample, Stats, Watcher};
 use crate::style::{self, ERR, OUT};
@@ -74,6 +75,8 @@ pub struct Entry {
     pub vm: Result<(Spec, State), String>,
     /// Bytes its disk takes up on the host, if the backend knows.
     pub disk: Option<u64>,
+    /// Packages or the setup script are going in right now.
+    pub setting_up: bool,
 }
 
 /// Every VM, sorted by name, with its state asked of its backend.
@@ -93,7 +96,8 @@ pub fn entries(home: &Home) -> Result<Vec<Entry>> {
                 };
                 (vm.spec, state)
             });
-            Entry { name, vm, disk }
+            let setting_up = home.vms().join(&name).join(setup::MARKER).exists();
+            Entry { name, vm, disk, setting_up }
         })
         .collect())
 }
@@ -677,6 +681,9 @@ impl App {
             disk: "20G".into(),
             arch: Some(self.host),
             no_start: false,
+            install: vec![],
+            setup: None,
+            bare: false,
         };
         match NewForm::new(&self.home, args) {
             Ok(form) => self.modal = Some(Modal::New(Box::new(form))),
@@ -1323,8 +1330,8 @@ impl App {
         if busy.verb != Verb::Create {
             return Some(busy.verb.doing().into());
         }
-        if self.vms.iter().flatten().any(|e| e.name == name) {
-            return Some("booting".into());
+        if let Some(entry) = self.vms.iter().flatten().find(|e| e.name == name) {
+            return Some(if entry.setting_up { "installing" } else { "booting" }.into());
         }
         let image = busy.pending.as_ref().map(|p| p.image.as_str()).unwrap_or_default();
         Some(self.download_progress(image).unwrap_or_else(|| "creating".into()))
@@ -1626,7 +1633,7 @@ impl App {
             .chain(pending.iter().map(|(_, p)| p.image.chars().count()));
         let widths = [
             Constraint::Length(names.max().unwrap_or(0).clamp(4, NAME_MAX) as u16),
-            Constraint::Length(10),
+            Constraint::Length(12), // "⠧ installing"
             Constraint::Length(images.max().unwrap_or(0).clamp(5, IMAGE_MAX) as u16),
             Constraint::Length(7),
             Constraint::Length(4),
@@ -1776,6 +1783,15 @@ fn new_argv(args: &NewArgs) -> Vec<String> {
     }
     if let Some(arch) = args.arch {
         argv.extend(["--arch".into(), arch.to_string()]);
+    }
+    if args.bare {
+        argv.push("--bare".into());
+    }
+    if !args.install.is_empty() {
+        argv.extend(["--install".into(), args.install.join(",")]);
+    }
+    if let Some(setup) = &args.setup {
+        argv.extend(["--setup".into(), setup.clone()]);
     }
     argv
 }
@@ -2151,7 +2167,7 @@ mod tests {
             ssh: SshSpec { user: "me".into(), port },
             qemu: None,
         };
-        Entry { name: name.into(), vm: Ok((spec, state)), disk: Some(3_100_000_000) }
+        Entry { name: name.into(), vm: Ok((spec, state)), disk: Some(3_100_000_000), setting_up: false }
     }
 
     fn info(name: &str, on_disk: u64, custom: bool, native: bool) -> Info {
@@ -2190,7 +2206,7 @@ mod tests {
         vec![
             entry("dev", State::Running, "debian-13", 2222),
             entry("web", State::Stopped, "fedora-44", 2223),
-            Entry { name: "old".into(), vm: Err("invalid vx.toml".into()), disk: None },
+            Entry { name: "old".into(), vm: Err("invalid vx.toml".into()), disk: None, setting_up: false },
         ]
     }
 
@@ -2212,9 +2228,9 @@ mod tests {
 
     const VM_GOLDEN: &str = "\
 ╭─ vx ─ VMs · images ────────────────────────────────────── 3 VMs · 1 running ─╮
-│ NAME  STATE       IMAGE      ARCH     CPUS  MEMORY  SSH                      │
-│ dev   ● running   debian-13  aarch64     4      4G  127.0.0.1:2222           │
-│ web   ○ stopped   fedora-44  aarch64     4      4G  127.0.0.1:2223           │
+│ NAME  STATE         IMAGE      ARCH     CPUS  MEMORY  SSH                    │
+│ dev   ● running     debian-13  aarch64     4      4G  127.0.0.1:2222         │
+│ web   ○ stopped     fedora-44  aarch64     4      4G  127.0.0.1:2223         │
 │ old   ✗ broken                                                               │
 │                                                                              │
 ╰─ ⏎ ssh · x stop · p pause · S snaps · n new · tab images · ? keys · q quit ──╯";

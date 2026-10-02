@@ -43,6 +43,7 @@ On a terminal at least 120 columns wide, the selected VM's details sit on the ri
 ```
 vx new web --image fedora-44 --cpus 2 --mem 8G --disk 40G
 vx new                          # no name: fill in a form
+vx install <vm> <package>...    # see "Set up new VMs your way" below
 vx ls
 vx start | stop | pause | resume <vm>
 vx ssh <vm> [-- cmd]            # starts it first if needed
@@ -55,6 +56,24 @@ vx rm <vm>
 ```
 
 Leave out the VM name and you get a picker.
+
+## Set up new VMs your way
+
+Have every new VM come with your tools, on any distro:
+
+```toml
+# ~/.vx/config.toml
+[new]
+install = ["git", "build-tools", "python", "tmux"]
+setup = "~/.vx/setup.sh"     # optional: a script of yours, run in the VM as you
+```
+
+`vx new` installs the packages once the VM is up, then runs the script, showing progress as it goes. Package names are the distro's own, except a few that differ between distros, which work everywhere: `build-tools`, `python`, `node`, `go`, `rust` and `fd`. On Rocky, Alma and CentOS, EPEL is turned on when a package needs it.
+
+- `vx new dev --install htop,jq` adds to the defaults for one VM; `--bare` skips them; `--setup ./other.sh` runs a different script.
+- `vx install dev ripgrep` installs into a VM you already have.
+- In the dashboard, the new-VM form shows the defaults, ready to change for that VM.
+- Everything they print goes to `~/.vx/vms/<vm>/setup.log`.
 
 ## Snapshots
 

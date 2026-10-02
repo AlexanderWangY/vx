@@ -4,6 +4,8 @@ The Release workflow uses the section matching each version as its GitHub Releas
 
 ## Unreleased
 
+- **New VMs come set up the way you like.** List packages in `~/.vx/config.toml` (`[new] install = ["git", "build-tools"]`) and every `vx new` installs them once the VM is up, then runs your own setup script if you give one (`setup = "~/.vx/setup.sh"`, run as you). `build-tools`, `python`, `node`, `go`, `rust` and `fd` work on every distro; other names are the distro's own. `vx new --install`, `--setup` and `--bare` change it for one VM, the dashboard's new-VM form shows it, and `vx install <vm> <packages>` installs into an existing VM.
+
 - `vx port` forwards ports into a VM: `vx port dev 8080:80`, or `vx port dev 3000` for the same port on both sides. A running VM picks it up straight away, and it's saved in `vx.toml` for next time. `vx port dev` lists them, `vx port rm dev 8080` removes one, and `f` in the dashboard does all three.
 - `vx cp` copies files and directories into or out of a VM: `vx cp notes.txt src/ dev:/tmp/`, `vx cp dev:out.log .`. It starts the VM first if it's stopped.
 

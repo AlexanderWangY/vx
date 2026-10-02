@@ -20,6 +20,7 @@ use crate::host::Arch;
 use crate::image::{self, Source};
 use crate::ports;
 use crate::progress::bytes;
+use crate::setup;
 use crate::snapshot;
 use crate::style::{self, OUT};
 use crate::vx::{self, Home, Spec};
@@ -170,9 +171,12 @@ enum Field {
     Cpus,
     Memory,
     Disk,
+    Install,
+    Setup,
 }
 
-const FIELDS: [Field; 5] = [Field::Name, Field::Image, Field::Cpus, Field::Memory, Field::Disk];
+const FIELDS: [Field; 7] =
+    [Field::Name, Field::Image, Field::Cpus, Field::Memory, Field::Disk, Field::Install, Field::Setup];
 
 /// One row of the image list.
 struct Choice {
@@ -203,10 +207,17 @@ pub struct NewForm {
     cpus: Input,
     memory: Input,
     disk: Input,
+    /// Packages, separated by commas or spaces; starts as the defaults from config.toml.
+    install: Input,
+    /// The setup script; starts as the default from config.toml.
+    setup: Input,
+    /// Whether the two above came from config.toml, for the tips.
+    has_defaults: bool,
 }
 
-/// Rows besides the image list: name, blank, blank, sizes, blank, message, help.
-const FIXED_ROWS: u16 = 7;
+/// Rows besides the image list: name, blank, blank, sizes, blank, install, setup, blank,
+/// message, help.
+const FIXED_ROWS: u16 = 10;
 const IMAGE_ROWS: u16 = 7;
 const LABEL: usize = 8;
 const MARGIN: &str = "  ";
@@ -256,6 +267,9 @@ impl NewForm {
         }
         let selected = images.iter().position(|c| c.arg == args.image).unwrap_or(0);
         let name = args.name.unwrap_or_else(|| suggest_name(home));
+        let config = setup::Config::load(home)?;
+        let plan = setup::Plan::new(&config.new, args.bare, &args.install, args.setup.as_deref());
+        let has_defaults = !args.bare && (!config.new.install.is_empty() || config.new.setup.is_some());
         Ok(NewForm {
             home: Home::at(home.root()),
             arch,
@@ -269,6 +283,9 @@ impl NewForm {
             cpus: Input::new(&args.cpus.unwrap_or(defaults.cpus).to_string()),
             memory: Input::new(args.mem.as_deref().unwrap_or(&defaults.memory)),
             disk: Input::new(&args.disk),
+            install: Input::new(&plan.install.join(", ")),
+            setup: Input::new(plan.setup.as_deref().unwrap_or_default()),
+            has_defaults,
             defaults,
         })
     }
@@ -279,8 +296,15 @@ impl NewForm {
             Field::Cpus => Some(&mut self.cpus),
             Field::Memory => Some(&mut self.memory),
             Field::Disk => Some(&mut self.disk),
+            Field::Install => Some(&mut self.install),
+            Field::Setup => Some(&mut self.setup),
             Field::Image => None,
         }
+    }
+
+    /// The packages typed into Install.
+    fn packages(&self) -> Vec<String> {
+        self.install.text.split([',', ' ']).filter(|p| !p.is_empty()).map(String::from).collect()
     }
 
     /// Why `field` can't be used as is.
@@ -298,6 +322,12 @@ impl NewForm {
             },
             Field::Memory => (!vx::is_size(&self.memory.text)).then(|| "use a size like 4G or 512M".into()),
             Field::Disk => (!vx::is_size(&self.disk.text)).then(|| "use a size like 20G or 50G".into()),
+            Field::Install => self.packages().iter().find_map(|p| setup::check_package(p).err()).map(|e| e.to_string()),
+            Field::Setup if self.setup.text.trim().is_empty() => None,
+            Field::Setup => {
+                let path = setup::expand(self.setup.text.trim());
+                (!path.is_file()).then(|| format!("no file at {}", path.display()))
+            }
         }
     }
 
@@ -332,13 +362,16 @@ impl NewForm {
                 self.focus = match self.focus {
                     Field::Name | Field::Image => Field::Name,
                     Field::Cpus | Field::Memory | Field::Disk => Field::Image,
+                    Field::Install => Field::Cpus,
+                    Field::Setup => Field::Install,
                 }
             }
             KeyCode::Down => {
                 self.focus = match self.focus {
                     Field::Name => Field::Image,
                     Field::Image => Field::Cpus,
-                    row => row,
+                    Field::Cpus | Field::Memory | Field::Disk => Field::Install,
+                    Field::Install | Field::Setup => Field::Setup,
                 }
             }
             _ if self.focus == Field::Image => self.image_key(key),
@@ -353,6 +386,11 @@ impl NewForm {
                         _ => None,
                     }),
                     Field::Cpus => (3, |c| c.is_ascii_digit().then_some(c)),
+                    Field::Install => (400, |c| {
+                        (c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '@' | ':' | ',' | ' '))
+                            .then_some(c)
+                    }),
+                    Field::Setup => (4096, |c| (!c.is_control()).then_some(c)),
                     _ => (8, |c| match c {
                         '0'..='9' => Some(c),
                         'k' | 'm' | 'g' | 't' | 'K' | 'M' | 'G' | 'T' => Some(c.to_ascii_uppercase()),
@@ -405,6 +443,10 @@ impl NewForm {
             disk: self.disk.text.clone(),
             arch: (arch != host).then_some(arch),
             no_start: self.no_start,
+            // What the form shows is the whole of it, defaults included.
+            install: self.packages(),
+            setup: Some(self.setup.text.trim().to_string()).filter(|s| !s.is_empty()),
+            bare: true,
         })
     }
 
@@ -497,6 +539,25 @@ impl NewForm {
         lines.push(Line::from(spans));
         lines.push(Line::default());
 
+        // What to install and run once it's up, each scrolled to keep the cursor in view.
+        for (field, title) in [(Field::Install, "Install"), (Field::Setup, "Setup")] {
+            let input = if field == Field::Install { &self.install } else { &self.setup };
+            let room = (area.width as usize).saturating_sub(MARGIN.len() + LABEL + 1).max(1);
+            let skip = input.cursor.saturating_sub(room);
+            let shown: String = input.text.chars().skip(skip).take(room).collect();
+            if self.focus == field {
+                let x = MARGIN.len() + LABEL + input.cursor - skip;
+                cursor = Some(Position::new(area.x + x as u16, y(&lines)));
+            }
+            let shown = if shown.is_empty() && self.focus != field {
+                Span::styled("none", DIM)
+            } else {
+                Span::styled(shown, self.value_style(field))
+            };
+            lines.push(Line::from(vec![Span::raw(MARGIN), self.label(title, field), shown]));
+        }
+        lines.push(Line::default());
+
         lines.push(Line::from(vec![Span::raw(MARGIN), self.message()]));
         let help = if self.focus == Field::Image {
             "↑↓ choose · tab next field · enter create · esc cancel"
@@ -554,6 +615,11 @@ impl NewForm {
             }
             Field::Memory => "e.g. 2G, 8G or 512M".into(),
             Field::Disk => "the VM's disk grows to this size".into(),
+            Field::Install if self.has_defaults => {
+                "your defaults from ~/.vx/config.toml; change them for this VM".into()
+            }
+            Field::Install => "e.g. git, build-tools, python; those last two work on any distro".into(),
+            Field::Setup => "a script of yours, run in the VM as you once the packages are in".into(),
         };
         Span::styled(tip, DIM)
     }
@@ -925,8 +991,9 @@ fn suggest_name(home: &Home) -> String {
 }
 
 /// The command line that does what the form did, so it can be typed directly next time.
-pub fn command_line(args: &NewArgs) -> Result<String> {
+pub fn command_line(home: &Home, args: &NewArgs) -> Result<String> {
     let defaults = Spec::defaults()?;
+    let config = setup::Config::load(home)?;
     let mut line = format!("vx new {}", args.name.as_deref().unwrap_or_default());
     if args.image != image::DEFAULT {
         line += &format!(" --image {}", args.image);
@@ -945,6 +1012,22 @@ pub fn command_line(args: &NewArgs) -> Result<String> {
     }
     if args.no_start {
         line += " --no-start";
+    }
+    // Only what differs from the defaults in config.toml.
+    let usual = setup::Plan::new(&config.new, false, &[], None);
+    let plan = setup::Plan::new(&config.new, args.bare, &args.install, args.setup.as_deref());
+    if plan != usual {
+        let extra = plan.install.starts_with(&usual.install) && plan.setup == usual.setup;
+        let install = if extra { &plan.install[usual.install.len()..] } else { &plan.install[..] };
+        if !extra {
+            line += " --bare";
+        }
+        if !install.is_empty() {
+            line += &format!(" --install {}", install.join(","));
+        }
+        if let (false, Some(script)) = (extra, &plan.setup) {
+            line += &format!(" --setup {script}");
+        }
     }
     Ok(line)
 }
@@ -1075,6 +1158,9 @@ mod tests {
             disk: "20G".into(),
             arch: Some(Arch::Aarch64),
             no_start: false,
+            install: vec![],
+            setup: None,
+            bare: false,
         }
     }
 
@@ -1117,7 +1203,7 @@ mod tests {
     fn draws_the_new_form() {
         let home = home();
         let mut form = form(&home);
-        let (text, cursor) = screen(&mut form, 80, 14);
+        let (text, cursor) = screen(&mut form, 80, 17);
         assert_eq!(
             text,
             "  Name    dev                              ✓
@@ -1132,10 +1218,45 @@ mod tests {
 
   CPUs    4        Memory  4G       Disk    20G
 
+  Install none
+  Setup   none
+
   ssh into it later with `vx ssh dev`
   tab/↑↓ move · enter create · esc cancel"
         );
         assert_eq!(cursor, Some((13, 0)), "cursor after `dev`");
+    }
+
+    #[test]
+    fn install_and_setup_start_from_the_defaults() {
+        // Its own home, so its config.toml can't reach the other tests.
+        let home = Home::at(std::env::temp_dir().join(format!("vx-form-config-{}", std::process::id())));
+        std::fs::create_dir_all(home.root()).unwrap();
+        std::fs::write(setup::Config::path(&home), "[new]\ninstall = [\"git\", \"build-tools\"]\n").unwrap();
+        let mut form = form(&home);
+        std::fs::remove_dir_all(home.root()).unwrap();
+        let (text, _) = screen(&mut form, 80, 17);
+        assert!(text.contains("  Install git, build-tools"), "{text}");
+        // Tab past the image and sizes to Install; add one, and check what's typed.
+        for _ in 0..5 {
+            let _ = form.key(press(KeyCode::Tab));
+        }
+        assert!(screen(&mut form, 80, 17).0.contains("your defaults from ~/.vx/config.toml"));
+        for c in ", htop".chars() {
+            let _ = form.key(press(KeyCode::Char(c)));
+        }
+        let _ = form.key(press(KeyCode::Down)); // Setup
+        for c in "/no/such/script.sh".chars() {
+            let _ = form.key(press(KeyCode::Char(c)));
+        }
+        assert!(screen(&mut form, 80, 17).0.contains("no file at /no/such/script.sh"));
+        assert!(matches!(form.key(press(KeyCode::Enter)), Step::Continue), "a missing script blocks it");
+        let _ = form.key(press(KeyCode::Char('u')));
+        let ctrl_u = KeyEvent { modifiers: KeyModifiers::CONTROL, ..press(KeyCode::Char('u')) };
+        let _ = form.key(ctrl_u);
+        let args = done(form.key(press(KeyCode::Enter)));
+        assert_eq!(args.install, ["git", "build-tools", "htop"]);
+        assert_eq!((args.setup, args.bare), (None, true), "the form's list is the whole of it");
     }
 
     #[test]
@@ -1256,7 +1377,9 @@ mod tests {
             arch: None,
             ..args()
         };
-        assert_eq!(command_line(&args).unwrap(), "vx new web --image fedora-44 --mem 8G");
+        assert_eq!(command_line(&home(), &args).unwrap(), "vx new web --image fedora-44 --mem 8G");
+        let args = NewArgs { install: vec!["git".into(), "htop".into()], ..args };
+        assert_eq!(command_line(&home(), &args).unwrap(), "vx new web --image fedora-44 --mem 8G --install git,htop");
     }
 
     #[test]
