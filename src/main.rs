@@ -11,6 +11,7 @@ mod progress;
 mod qemu;
 mod qmp;
 mod seed;
+mod snapshot;
 mod ssh;
 mod stats;
 mod style;
@@ -29,6 +30,7 @@ use clap::{Parser, Subcommand};
 use backend::State;
 use host::Arch;
 use image::Source;
+use snapshot::History;
 use style::{ERR, Label, OUT};
 use vx::{Home, Spec, Vm};
 
@@ -82,10 +84,48 @@ enum Command {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Save a VM as it is now, to go back to later (`vx snap ls` shows them)
+    Snap(SnapArgs),
     /// List the images `vx new` can use, or manage them
     Images {
         #[command(subcommand)]
         action: Option<ImagesCommand>,
+    },
+}
+
+#[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct SnapArgs {
+    #[command(subcommand)]
+    action: Option<SnapCommand>,
+    /// The VM to snapshot (leave it out to pick one)
+    vm: Option<String>,
+    /// What to call the snapshot [default: snap-1, snap-2, …]
+    name: Option<String>,
+    /// A note to remember it by
+    #[arg(short, long)]
+    message: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum SnapCommand {
+    /// Show a VM's snapshots as a tree
+    Ls { vm: Option<String> },
+    /// Put a VM back how it was at a snapshot
+    Restore {
+        vm: String,
+        snapshot: String,
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Delete a snapshot; the ones taken after it stay
+    Rm {
+        vm: String,
+        snapshot: String,
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -221,6 +261,22 @@ fn run(cli: Cli) -> Result<()> {
                 rm(vm, yes)?;
             }
         }
+        Command::Snap(SnapArgs { action: None, vm, name, message }) => {
+            if let Some(vm) = pick(vm, "snap", "Which VM do you want to snapshot?", None)? {
+                snap(&home, &vm, name, message.unwrap_or_default())?;
+            }
+        }
+        Command::Snap(SnapArgs { action: Some(SnapCommand::Ls { vm }), .. }) => {
+            if let Some(vm) = pick(vm, "snap ls", "Whose snapshots?", None)? {
+                snap_ls(&vm)?;
+            }
+        }
+        Command::Snap(SnapArgs { action: Some(SnapCommand::Restore { vm, snapshot, yes }), .. }) => {
+            snap_restore(&home.load(&vm)?, &snapshot, yes)?;
+        }
+        Command::Snap(SnapArgs { action: Some(SnapCommand::Rm { vm, snapshot, yes }), .. }) => {
+            snap_rm(&home.load(&vm)?, &snapshot, yes)?;
+        }
         Command::Images { action: None } => images(&home)?,
         Command::Images { action: Some(action) } => images_command(&home, action)?,
     }
@@ -347,14 +403,150 @@ fn rm(vm: Vm, yes: bool) -> Result<()> {
 }
 
 fn confirm(vm: &Vm) -> Result<bool> {
+    let question = format!("delete {} and its disk?", ERR.bold(&vm.name));
+    ask(&question, format!("not deleting {} without confirmation", vm.name), format!("vx rm -y {}", vm.name))
+}
+
+/// Ask a yes/no question, defaulting to no. Without a terminal to ask on, fails with `why` and
+/// `hint`, which should say how to skip the question.
+fn ask(question: &str, why: String, hint: String) -> Result<bool> {
     if !io::stdin().is_terminal() {
-        return Err(hinted(format!("not deleting {} without confirmation", vm.name), format!("vx rm -y {}", vm.name)));
+        return Err(hinted(why, hint));
     }
-    eprint!("delete {} and its disk? {} ", ERR.bold(&vm.name), ERR.dim("[y/N]"));
+    eprint!("{question} {} ", ERR.dim("[y/N]"));
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
+fn snapshots(vm: &Vm) -> Result<&'static dyn backend::Snapshots> {
+    let backend = backend::get(&vm.spec.backend)?;
+    match backend.snapshots() {
+        Some(s) => Ok(s),
+        None => bail!("the {} backend can't take snapshots", vm.spec.backend),
+    }
+}
+
+fn snap(home: &Home, vm: &Vm, name: Option<String>, note: String) -> Result<()> {
+    let backend = snapshots(vm)?;
+    let _lock = vm.lock()?;
+    let mut history = History::load(vm, backend)?;
+    let name = name.unwrap_or_else(|| history.next_name());
+    snapshot::validate_name(&name)?;
+    if history.get(&name).is_some() {
+        return Err(hinted(
+            format!("{} already has a snapshot called `{name}`", vm.name),
+            format!("pick another name, or delete it with `vx snap rm {} {name}`", vm.name),
+        ));
+    }
+    // Saving memory while the guest is still in its firmware or early boot leaves it hung
+    // (QEMU with HVF), so memory waits until it's up, which sshd answering shows.
+    let memory = match backend::get(&vm.spec.backend)?.state(vm) {
+        State::Running => {
+            let config = ssh::write_config(home, vm, backend::get(&vm.spec.backend)?.ssh_addr(vm))?;
+            let up = ssh::reachable(&config, vm);
+            if !up {
+                style::warn("", format!("{} is still booting, so only its disk is saved", vm.name));
+            }
+            up
+        }
+        _ => true,
+    };
+    let saved = backend.save(vm, &name, memory)?;
+    let what = match saved.memory {
+        0 => "disk".to_string(),
+        n => format!("memory and disk · {} of memory", progress::bytes(n)),
+    };
+    history.add(saved, note);
+    history.save(vm)?;
+    println!("{} saved {} as {name} {}", OUT.green('✓'), vm.name, OUT.dim(format!("({what})")));
+    println!("{}", OUT.dim(format!("go back to it with `vx snap restore {} {name}`", vm.name)));
+    Ok(())
+}
+
+fn snap_ls(vm: &Vm) -> Result<()> {
+    let backend = snapshots(vm)?;
+    let history = History::load(vm, backend)?;
+    if history.entries.is_empty() {
+        println!("{} has no snapshots yet; take one with `vx snap {}`", vm.name, vm.name);
+        return Ok(());
+    }
+    let rows = history.rows(&|_| true);
+    let label = |row: &snapshot::Row| match row.at {
+        snapshot::At::Snapshot(i) => {
+            let e = &history.entries[i];
+            format!("{}{} {}", row.graph, snapshot::marker(e), e.snap.name)
+        }
+        snapshot::At::Now => format!("{}{} now", row.graph, snapshot::NOW),
+    };
+    let w = rows.iter().map(|r| label(r).chars().count()).max().unwrap_or(0);
+    let state = backend::get(&vm.spec.backend)?.state(vm);
+    for row in &rows {
+        let text = label(row);
+        let pad = " ".repeat(w - text.chars().count());
+        match row.at {
+            snapshot::At::Snapshot(i) => {
+                let e = &history.entries[i];
+                let memory = match e.snap.memory {
+                    0 => String::new(),
+                    n => format!("+{} memory", progress::bytes(n)),
+                };
+                let when = OUT.dim(format!("{:>8}", snapshot::ago(e.snap.created)));
+                let line = format!("{text}{pad}  {when}  {:16}  {}", OUT.dim(memory), e.note);
+                println!("{}", line.trim_end());
+            }
+            snapshot::At::Now => println!("{}{pad}  {}", OUT.cyan(text), OUT.dim(state.to_string())),
+        }
+    }
+    println!();
+    println!("{}", OUT.dim("● memory and disk  ○ disk only  ◉ where the VM is now"));
+    Ok(())
+}
+
+fn snap_restore(vm: &Vm, name: &str, yes: bool) -> Result<()> {
+    let backend = snapshots(vm)?;
+    let mut history = History::load(vm, backend)?;
+    let entry = history.find(vm, name)?.clone();
+    if !yes {
+        let question = format!(
+            "restore {} to {}? what it has now is lost unless you snapshot it first",
+            ERR.bold(&vm.name),
+            ERR.bold(name)
+        );
+        let why = format!("not restoring {} without confirmation", vm.name);
+        if !ask(&question, why, format!("vx snap restore -y {} {name}", vm.name))? {
+            println!("left {} as it is", vm.name);
+            return Ok(());
+        }
+    }
+    let _lock = vm.lock()?;
+    backend.restore(vm, &entry.snap)?;
+    history.current = Some(name.to_string());
+    history.save(vm)?;
+    let state = backend::get(&vm.spec.backend)?.state(vm);
+    println!("{} {} is back at {name} {}", OUT.green('✓'), vm.name, OUT.dim(format!("({state})")));
+    Ok(())
+}
+
+fn snap_rm(vm: &Vm, name: &str, yes: bool) -> Result<()> {
+    let backend = snapshots(vm)?;
+    let mut history = History::load(vm, backend)?;
+    history.find(vm, name)?;
+    if !yes {
+        let question = format!("delete snapshot {} of {}?", ERR.bold(name), ERR.bold(&vm.name));
+        let why = format!("not deleting {name} without confirmation");
+        if !ask(&question, why, format!("vx snap rm -y {} {name}", vm.name))? {
+            println!("kept {name}");
+            return Ok(());
+        }
+    }
+    let _lock = vm.lock()?;
+    backend.delete(vm, name)?;
+    history.remove(name);
+    history.save(vm)?;
+    println!("{} deleted {name} from {}", OUT.green('✓'), vm.name);
+    Ok(())
 }
 
 fn attach(vm: &Vm) -> Result<()> {

@@ -65,6 +65,9 @@ pub trait Backend: Sync {
     fn command_line(&self) -> Option<&dyn CommandLine> {
         None
     }
+    fn snapshots(&self) -> Option<&dyn Snapshots> {
+        None
+    }
 }
 
 pub trait Pause {
@@ -74,6 +77,28 @@ pub trait Pause {
 
 pub trait Console {
     fn attach(&self, vm: &Vm) -> Result<UnixStream>;
+}
+
+/// A snapshot as the backend keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snap {
+    pub name: String,
+    /// Seconds since the Unix epoch.
+    pub created: u64,
+    /// Bytes of saved memory; 0 for a snapshot of the disk alone.
+    pub memory: u64,
+}
+
+pub trait Snapshots {
+    /// Oldest first.
+    fn list(&self, vm: &Vm) -> Result<Vec<Snap>>;
+    /// Save the VM as it is now. A running VM keeps running. With `memory`, its memory is
+    /// saved too if the backend can. Returns the snapshot.
+    fn save(&self, vm: &Vm, name: &str, memory: bool) -> Result<Snap>;
+    /// Put the VM back as it was at `snap`: running from that moment if its memory was saved,
+    /// otherwise its disk as it was, and running again (from boot) if it was running.
+    fn restore(&self, vm: &Vm, snap: &Snap) -> Result<()>;
+    fn delete(&self, vm: &Vm, name: &str) -> Result<()>;
 }
 
 /// The exact command line a VM runs with (`vx cmd`).
