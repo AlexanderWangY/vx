@@ -2,6 +2,17 @@
 name = "vx"
 version = "0.1.0"
 edition = "2024"
+# File::try_lock and let chains.
+rust-version = "1.89"
+description = "Zero-config Linux VMs from the terminal: a CLI and dashboard on top of QEMU"
+license = "MIT"
+repository = "https://github.com/AlexanderWangY/vx"
+homepage = "https://github.com/AlexanderWangY/vx"
+readme = "README.md"
+keywords = ["vm", "qemu", "virtualization", "cli", "tui"]
+categories = ["command-line-utilities", "virtualization"]
+# Released through GitHub and Homebrew, not crates.io.
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"
@@ -14,3 +25,12 @@ serde_json = "1.0.151"
 sha2 = "0.11.0"
 toml = "1.1.6"
 ureq = { version = "3.4.2", default-features = false, features = ["rustls", "platform-verifier"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# `publish = false` hides it from dist otherwise.
+[package.metadata.dist]
+dist = true
