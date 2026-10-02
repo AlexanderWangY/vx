@@ -19,6 +19,7 @@ use crate::backend::{self, State};
 use crate::host::Arch;
 use crate::image::{self, Source};
 use crate::progress::bytes;
+use crate::snapshot;
 use crate::style::{self, OUT};
 use crate::vx::{self, Home, Spec};
 use crate::{NewArgs, hinted};
@@ -691,6 +692,95 @@ impl AddImageForm {
             None => Line::styled(format!("use it with `vx new <name> --image {}`", self.name.text), DIM),
         });
         lines.push(Line::styled("tab move · enter add · esc cancel", DIM));
+        frame.render_widget(Paragraph::new(lines), area);
+        if let Some(position) = cursor.filter(|p| area.contains(*p)) {
+            frame.set_cursor_position(position);
+        }
+    }
+}
+
+/// The dashboard's "snapshot" form: a name, and a note to remember it by.
+pub struct SnapForm {
+    vm: String,
+    /// Names already taken.
+    taken: Vec<String>,
+    /// 0: name, 1: note.
+    focus: usize,
+    name: Input,
+    note: Input,
+}
+
+/// What the snapshot form produces.
+pub struct NewSnap {
+    pub name: String,
+    pub note: String,
+}
+
+impl SnapForm {
+    pub const HEIGHT: u16 = 6;
+
+    pub fn new(vm: &str, suggested: &str, taken: Vec<String>) -> SnapForm {
+        SnapForm { vm: vm.into(), taken, focus: 0, name: Input::new(suggested), note: Input::default() }
+    }
+
+    fn problem(&self) -> Option<String> {
+        let name = &self.name.text;
+        if name.is_empty() {
+            return Some("give it a name".into());
+        }
+        if self.taken.contains(name) {
+            return Some(format!("{} already has a snapshot called {name}", self.vm));
+        }
+        snapshot::validate_name(name).err().map(|e| e.to_string())
+    }
+
+    pub fn handle(&mut self, key: KeyEvent) -> Step<NewSnap> {
+        match key.code {
+            KeyCode::Esc => return Step::Cancel,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => self.focus = 1 - self.focus,
+            KeyCode::Enter => {
+                if self.problem().is_some() {
+                    self.focus = 0;
+                    return Step::Continue;
+                }
+                return Step::Done(NewSnap { name: self.name.text.clone(), note: self.note.text.trim().to_string() });
+            }
+            _ if self.focus == 0 => self.name.edit(key, 32, |c| match c {
+                'a'..='z' | '0'..='9' | '-' | '.' => Some(c),
+                'A'..='Z' => Some(c.to_ascii_lowercase()),
+                ' ' | '_' => Some('-'),
+                _ => None,
+            }),
+            _ => self.note.edit(key, 200, |c| (!c.is_control()).then_some(c)),
+        }
+        Step::Continue
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let mut lines = Vec::new();
+        let mut cursor = None;
+        for (i, (title, input)) in [("Name", &self.name), ("Note", &self.note)].into_iter().enumerate() {
+            let label_style = if self.focus == i { ACCENT } else { Style::new() };
+            let mark = match (i, self.problem()) {
+                (0, None) => Span::styled(" ✓", OK),
+                _ => Span::raw(""),
+            };
+            let room = (area.width as usize).saturating_sub(LABEL + 3).max(1);
+            let skip = input.cursor.saturating_sub(room);
+            let shown: String = input.text.chars().skip(skip).take(room).collect();
+            if self.focus == i {
+                let x = area.x + (LABEL + input.cursor - skip) as u16;
+                cursor = Some(Position::new(x, area.y + lines.len() as u16));
+            }
+            lines.push(Line::from(vec![Span::styled(format!("{title:LABEL$}"), label_style), Span::raw(shown), mark]));
+        }
+        lines.push(Line::default());
+        lines.push(match self.problem() {
+            Some(problem) => Line::styled(problem, ERROR),
+            None if self.focus == 1 => Line::styled("optional: what's special about this point", DIM),
+            None => Line::styled("a running VM's memory is saved too, so it resumes right where it was", DIM),
+        });
+        lines.push(Line::styled("tab move · enter save · esc cancel", DIM));
         frame.render_widget(Paragraph::new(lines), area);
         if let Some(position) = cursor.filter(|p| area.contains(*p)) {
             frame.set_cursor_position(position);

@@ -199,7 +199,8 @@ impl Snapshots for Qemu {
     fn list(&self, vm: &Vm) -> Result<Vec<Snap>> {
         let list = match self.state(vm) {
             State::Stopped => {
-                let info = host::run(qemu_img()?.args(["info", "--output=json"]).arg(vm.path("disk.qcow2")))?;
+                // -U: a read that doesn't wait on a `qemu-img snapshot` holding the disk's lock.
+                let info = host::run(qemu_img()?.args(["info", "-U", "--output=json"]).arg(vm.path("disk.qcow2")))?;
                 let mut info: Value = serde_json::from_str(&info).context("reading qemu-img info")?;
                 info["snapshots"].take()
             }
