@@ -4,6 +4,7 @@ The Release workflow uses the section matching each version as its GitHub Releas
 
 ## Unreleased
 
+- `vx port` forwards ports into a VM: `vx port dev 8080:80`, or `vx port dev 3000` for the same port on both sides. A running VM picks it up straight away, and it's saved in `vx.toml` for next time. `vx port dev` lists them, `vx port rm dev 8080` removes one, and `f` in the dashboard does all three.
 - `vx cp` copies files and directories into or out of a VM: `vx cp notes.txt src/ dev:/tmp/`, `vx cp dev:out.log .`. It starts the VM first if it's stopped.
 
 ## 0.2.0

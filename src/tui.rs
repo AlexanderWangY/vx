@@ -36,7 +36,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::NewArgs;
 use crate::backend::{self, State};
-use crate::form::{AddImageForm, NewForm, NewImage, NewSnap, SnapForm, Step};
+use crate::form::{AddImageForm, NewForm, NewImage, NewSnap, PortChange, PortsForm, SnapForm, Step};
 use crate::host::Arch;
 use crate::image::{self, Info};
 use crate::progress::bytes;
@@ -204,6 +204,8 @@ enum Verb {
     Snapshot,
     Restore,
     DeleteSnapshot,
+    Forward,
+    Unforward,
 }
 
 impl Verb {
@@ -234,6 +236,8 @@ impl Verb {
             Verb::Snapshot => "saving",
             Verb::Restore => "restoring",
             Verb::DeleteSnapshot => "deleting",
+            Verb::Forward => "forwarding",
+            Verb::Unforward => "unforwarding",
         }
     }
 
@@ -250,6 +254,8 @@ impl Verb {
             Verb::Snapshot => "saved",
             Verb::Restore => "restored",
             Verb::DeleteSnapshot => "deleted",
+            Verb::Forward => "forwarded",
+            Verb::Unforward => "unforwarded",
         }
     }
 }
@@ -268,6 +274,8 @@ impl fmt::Display for Verb {
             Verb::Snapshot => "save",
             Verb::Restore => "restore",
             Verb::DeleteSnapshot => "delete",
+            Verb::Forward => "forward a port to",
+            Verb::Unforward => "stop forwarding a port to",
         })
     }
 }
@@ -340,6 +348,8 @@ enum Modal {
     New(Box<NewForm>),
     AddImage(Box<AddImageForm>),
     Snap(Box<SnapForm>),
+    /// The ports of this VM.
+    Ports(String, Box<PortsForm>),
     /// Asking before restoring the snapshot view's VM to this snapshot.
     Restore(String),
     /// Asking before deleting this snapshot.
@@ -745,10 +755,34 @@ impl App {
                         args.extend(["-m".into(), note]);
                     }
                     self.snap_selected = None;
-                    return self.snap_job(vm.clone(), Verb::Snapshot, args, None, format!("✓ saved {vm} as {name}"));
+                    return self.vm_task(vm.clone(), Verb::Snapshot, args, None, format!("✓ saved {vm} as {name}"));
                 }
                 Step::Cancel => {}
                 Step::Continue => self.modal = Some(Modal::Snap(form)),
+            },
+            Modal::Ports(vm, mut form) => match form.handle(key) {
+                Step::Done(PortChange::Add(host, guest)) => {
+                    let args = vec!["port".into(), vm.clone(), format!("{host}:{guest}")];
+                    return self.vm_task(
+                        vm.clone(),
+                        Verb::Forward,
+                        args,
+                        None,
+                        format!("✓ localhost:{host} → {vm}:{guest}"),
+                    );
+                }
+                Step::Done(PortChange::Remove(host)) => {
+                    let args = vec!["port".into(), "rm".into(), vm.clone(), host.to_string()];
+                    return self.vm_task(
+                        vm,
+                        Verb::Unforward,
+                        args,
+                        None,
+                        format!("✓ stopped forwarding localhost:{host}"),
+                    );
+                }
+                Step::Cancel => {}
+                Step::Continue => self.modal = Some(Modal::Ports(vm, form)),
             },
             Modal::Restore(name) => {
                 let vm = self.snap_vm.clone();
@@ -757,13 +791,13 @@ impl App {
                 match key.code {
                     KeyCode::Char('y' | 'Y') => {
                         self.snap_selected = None;
-                        return self.snap_job(vm, Verb::Restore, restore, None, done);
+                        return self.vm_task(vm, Verb::Restore, restore, None, done);
                     }
                     // Snapshot what it has now, then go back.
                     KeyCode::Char('s' | 'S') => {
                         let save = vec!["snap".to_string(), vm.clone()];
                         self.snap_selected = None;
-                        return self.snap_job(vm, Verb::Restore, save, Some(restore), done);
+                        return self.vm_task(vm, Verb::Restore, save, Some(restore), done);
                     }
                     KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {}
                     _ => self.modal = Some(Modal::Restore(name)),
@@ -774,7 +808,7 @@ impl App {
                     let vm = self.snap_vm.clone();
                     let args = vec!["snap".into(), "rm".into(), "-y".into(), vm.clone(), name.clone()];
                     let done = format!("✓ deleted {name} from {vm}");
-                    return self.snap_job(vm, Verb::DeleteSnapshot, args, None, done);
+                    return self.vm_task(vm, Verb::DeleteSnapshot, args, None, done);
                 }
                 Some(false) => {}
                 None => self.modal = Some(Modal::DeleteSnapshot(name)),
@@ -791,6 +825,14 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('n') => self.open_new(None),
+            KeyCode::Char('f') => {
+                if let Some((name, _)) = self.target()
+                    && let Some(Entry { vm: Ok((spec, _)), .. }) = self.selected()
+                {
+                    let form = PortsForm::new(&name, spec.ssh.port, spec.forwards().collect());
+                    self.modal = Some(Modal::Ports(name, Box::new(form)));
+                }
+            }
             KeyCode::Char('S') => {
                 if let Some((name, _)) = self.target() {
                     self.open_snapshots(name);
@@ -850,7 +892,7 @@ impl App {
     }
 
     /// A job on VM `vm`, which shows as busy until it ends and then says `done`.
-    fn snap_job(
+    fn vm_task(
         &mut self,
         vm: String,
         verb: Verb,
@@ -873,7 +915,7 @@ impl App {
             }
             None => format!("✓ saved a snapshot of {vm}"),
         };
-        self.snap_job(vm, Verb::Snapshot, args, None, done)
+        self.vm_task(vm, Verb::Snapshot, args, None, done)
     }
 
     fn snap_key(&mut self, key: KeyEvent) -> Action {
@@ -1101,6 +1143,10 @@ impl App {
                 let inner = dialog(frame, area, 72, SnapForm::HEIGHT + 4, "snapshot", BORDER, 2);
                 form.render(frame, inner);
             }
+            Some(Modal::Ports(vm, form)) => {
+                let inner = dialog(frame, area, 72, form.height() + 4, &format!("{vm}'s ports"), BORDER, 2);
+                form.render(frame, inner);
+            }
             Some(Modal::Restore(name)) => {
                 let what = vec![
                     Span::raw("Take "),
@@ -1324,10 +1370,11 @@ impl App {
                 Line::from(vec![Span::styled(format!("{key:6}"), DIM), Span::raw(clip(&value, width - 6))])
             };
             lines.push(field("ssh", format!("127.0.0.1:{}", spec.ssh.port)));
-            if !spec.forward.is_empty() {
-                let ports: Vec<String> = spec.forward.iter().map(|f| f.replacen(':', " → ", 1)).collect();
-                lines.push(field("ports", ports.join(", ")));
-            }
+            let ports = match spec.forwards().map(|(h, g)| format!("{h} → {g}")).collect::<Vec<_>>() {
+                ports if ports.is_empty() => "none · f to forward one".to_string(),
+                ports => format!("{} · f to change", ports.join(", ")),
+            };
+            lines.push(field("ports", ports));
             if let Some(disk) = entry.disk {
                 lines.push(field("file", format!("{} on host", bytes(disk))));
             }
@@ -1996,6 +2043,7 @@ const HELP: [&[(&str, &str)]; 2] = [
         ("n", "new VM"),
         ("d", "delete"),
         ("i", "show or hide details"),
+        ("f", "forward ports"),
         ("S", "snapshots"),
         ("ctrl-s", "save a snapshot now"),
         ("", ""),
@@ -2641,6 +2689,48 @@ mod tests {
         assert!(text.contains("SNAPSHOTS") && text.contains("○  k8s ") && text.contains("○  nix-2 "), "{text}");
         assert!(!text.contains(" deps "), "only the newest three:\n{text}");
         assert!(text.contains("S all (2 more) · ctrl-s save one"), "{text}");
+    }
+
+    #[test]
+    fn ports_dialog_adds_and_removes() {
+        let mut app = with_vms(); // dev: SSH on 2222, nothing forwarded
+        assert!(screen(&mut app, 130, 20).contains("ports none · f to forward one"));
+        let _ = app.key(press(KeyCode::Char('f')));
+        let text = screen(&mut app, 100, 20);
+        assert!(text.contains("─ dev's ports ─") && text.contains("localhost:2222  → dev:22  ssh"), "{text}");
+        // Nothing to pick, so it starts on adding one, and checks what's typed.
+        typed(&mut app, "2222");
+        assert!(screen(&mut app, 100, 20).contains("2222 is dev's SSH port"));
+        let _ = app.key(press(KeyCode::Backspace));
+        let _ = app.key(press(KeyCode::Backspace));
+        typed(&mut app, "abc:80"); // letters are ignored
+        let add = job(&mut app, KeyCode::Enter).unwrap();
+        assert_eq!(add.args, ["port", "dev", "22:80"]);
+        assert_eq!(add.done.as_deref(), Some("✓ localhost:22 → dev:80"));
+
+        // With forwards to pick, d removes the selected one.
+        let mut app = with_vms();
+        if let Some(Entry { vm: Ok((spec, _)), .. }) = app.vms.as_mut().and_then(|v| v.first_mut()) {
+            spec.forward = vec!["8080:80".into(), "3000:3000".into()];
+        }
+        assert!(screen(&mut app, 130, 20).contains("ports 8080 → 80, 3000 → 3000 · f to change"));
+        let _ = app.key(press(KeyCode::Char('f')));
+        let _ = app.key(press(KeyCode::Down));
+        assert!(screen(&mut app, 100, 20).contains("▸ localhost:3000  → dev:3000"));
+        let rm = job(&mut app, KeyCode::Char('d')).unwrap();
+        assert_eq!(rm.args, ["port", "rm", "dev", "3000"]);
+
+        let mut app = with_vms();
+        if let Some(Entry { vm: Ok((spec, _)), .. }) = app.vms.as_mut().and_then(|v| v.first_mut()) {
+            spec.forward = vec!["8080:80".into()];
+        }
+        let _ = app.key(press(KeyCode::Char('f')));
+        let _ = app.key(press(KeyCode::Char('a')));
+        typed(&mut app, "8080:81");
+        assert!(screen(&mut app, 100, 20).contains("8080 is already forwarded"));
+        assert_eq!(app.key(press(KeyCode::Esc)), Action::None, "back to the list");
+        assert_eq!(app.key(press(KeyCode::Esc)), Action::None, "closed");
+        assert!(app.modal.is_none());
     }
 
     #[test]

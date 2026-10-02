@@ -68,6 +68,9 @@ pub trait Backend: Sync {
     fn snapshots(&self) -> Option<&dyn Snapshots> {
         None
     }
+    fn forwards(&self) -> Option<&dyn Forwards> {
+        None
+    }
 }
 
 pub trait Pause {
@@ -99,6 +102,16 @@ pub trait Snapshots {
     /// otherwise its disk as it was, and running again (from boot) if it was running.
     fn restore(&self, vm: &Vm, snap: &Snap) -> Result<()>;
     fn delete(&self, vm: &Vm, name: &str) -> Result<()>;
+}
+
+/// Changing a running VM's port forwards. vx.toml holds them across restarts; this is only
+/// what the VM does right now.
+pub trait Forwards {
+    /// Forward TCP 127.0.0.1:`host` on this machine to `guest` in the VM.
+    fn add(&self, vm: &Vm, host: u16, guest: u16) -> Result<()>;
+    fn remove(&self, vm: &Vm, host: u16) -> Result<()>;
+    /// What the running VM forwards, as (host, guest), SSH included.
+    fn active(&self, vm: &Vm) -> Result<Vec<(u16, u16)>>;
 }
 
 /// The exact command line a VM runs with (`vx cmd`).

@@ -18,6 +18,7 @@ use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use crate::backend::{self, State};
 use crate::host::Arch;
 use crate::image::{self, Source};
+use crate::ports;
 use crate::progress::bytes;
 use crate::snapshot;
 use crate::style::{self, OUT};
@@ -692,6 +693,126 @@ impl AddImageForm {
             None => Line::styled(format!("use it with `vx new <name> --image {}`", self.name.text), DIM),
         });
         lines.push(Line::styled("tab move · enter add · esc cancel", DIM));
+        frame.render_widget(Paragraph::new(lines), area);
+        if let Some(position) = cursor.filter(|p| area.contains(*p)) {
+            frame.set_cursor_position(position);
+        }
+    }
+}
+
+/// The dashboard's "ports" dialog: a VM's forwards, to remove one or add another.
+pub struct PortsForm {
+    vm: String,
+    ssh: u16,
+    forwards: Vec<(u16, u16)>,
+    selected: usize,
+    /// Typing a new forward; `None` while picking from the list.
+    adding: Option<Input>,
+}
+
+/// What the ports dialog asks for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PortChange {
+    Add(u16, u16),
+    Remove(u16),
+}
+
+impl PortsForm {
+    pub fn new(vm: &str, ssh: u16, forwards: Vec<(u16, u16)>) -> PortsForm {
+        // With nothing to pick, start on adding one.
+        let adding = forwards.is_empty().then(Input::default);
+        PortsForm { vm: vm.into(), ssh, forwards, selected: 0, adding }
+    }
+
+    pub fn height(&self) -> u16 {
+        self.forwards.len() as u16 + 6
+    }
+
+    /// The forward being typed, or why it won't do.
+    fn typed(&self) -> Option<Result<(u16, u16), String>> {
+        let text = self.adding.as_ref()?.text.trim();
+        if text.is_empty() {
+            return Some(Err("<port here>:<port in the VM>, e.g. 8080:80, or one port for both".into()));
+        }
+        let parsed = ports::parse(text).map_err(|_| "write it as 8080:80, or one port like 3000".to_string());
+        Some(parsed.and_then(|(host, guest)| {
+            if host == self.ssh {
+                Err(format!("{host} is {}'s SSH port", self.vm))
+            } else if self.forwards.iter().any(|(h, _)| *h == host) {
+                Err(format!("{host} is already forwarded"))
+            } else {
+                Ok((host, guest))
+            }
+        }))
+    }
+
+    pub fn handle(&mut self, key: KeyEvent) -> Step<PortChange> {
+        if let Some(input) = &mut self.adding {
+            match key.code {
+                KeyCode::Esc if self.forwards.is_empty() => return Step::Cancel,
+                KeyCode::Esc => self.adding = None,
+                KeyCode::Enter => {
+                    if let Some(Ok((host, guest))) = self.typed() {
+                        return Step::Done(PortChange::Add(host, guest));
+                    }
+                }
+                _ => input.edit(key, 11, |c| (c.is_ascii_digit() || c == ':').then_some(c)),
+            }
+            return Step::Continue;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Step::Cancel,
+            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.selected = (self.selected + 1).min(self.forwards.len().saturating_sub(1))
+            }
+            KeyCode::Char('a' | 'n') => self.adding = Some(Input::default()),
+            KeyCode::Char('d') | KeyCode::Delete | KeyCode::Backspace => {
+                if let Some((host, _)) = self.forwards.get(self.selected) {
+                    return Step::Done(PortChange::Remove(*host));
+                }
+            }
+            _ => {}
+        }
+        Step::Continue
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let mut lines = vec![Line::from(vec![
+            Span::styled(format!("localhost:{:<6}", self.ssh), DIM),
+            Span::styled(format!("→ {}:22  ssh", self.vm), DIM),
+        ])];
+        for (i, (host, guest)) in self.forwards.iter().enumerate() {
+            let picked = self.adding.is_none() && i == self.selected;
+            let style = if picked { ACCENT } else { Style::new() };
+            let mark = if picked { "▸ " } else { "  " };
+            let text = format!("localhost:{host:<6}→ {}:{guest}", self.vm);
+            lines.push(Line::from(vec![Span::styled(mark, ACCENT), Span::styled(text, style)]));
+        }
+        lines.push(Line::default());
+        let mut cursor = None;
+        match (&self.adding, self.typed()) {
+            (Some(input), typed) => {
+                let mark = if matches!(typed, Some(Ok(_))) { Span::styled(" ✓", OK) } else { Span::raw("") };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:LABEL$}", "Forward"), ACCENT),
+                    Span::raw(input.text.clone()),
+                    mark,
+                ]));
+                cursor = Some(Position::new(area.x + (LABEL + input.cursor) as u16, area.y + lines.len() as u16 - 1));
+                lines.push(match typed {
+                    Some(Err(why)) if input.text.trim().is_empty() => Line::styled(why, DIM),
+                    Some(Err(why)) => Line::styled(why, ERROR),
+                    _ => Line::styled("a running VM picks it up straight away; it's saved for next time too", DIM),
+                });
+                let back = if self.forwards.is_empty() { "cancel" } else { "back" };
+                lines.push(Line::styled(format!("enter add · esc {back}"), DIM));
+            }
+            (None, _) => {
+                lines.push(Line::styled("only this machine can reach them: they listen on 127.0.0.1", DIM));
+                lines.push(Line::styled("a add · d remove · ↑↓ select · esc close", DIM));
+            }
+        }
         frame.render_widget(Paragraph::new(lines), area);
         if let Some(position) = cursor.filter(|p| area.contains(*p)) {
             frame.set_cursor_position(position);

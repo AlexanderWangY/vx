@@ -11,7 +11,7 @@ use std::{fs, io, thread};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
-use crate::backend::{Backend, Check, CommandLine, Console, Pause, Snap, Snapshots, State};
+use crate::backend::{Backend, Check, CommandLine, Console, Forwards, Pause, Snap, Snapshots, State};
 use crate::host::{self, Arch, Os};
 use crate::style::{self, ERR};
 use crate::vx::Vm;
@@ -109,6 +109,10 @@ impl Backend for Qemu {
     }
 
     fn snapshots(&self) -> Option<&dyn Snapshots> {
+        Some(self)
+    }
+
+    fn forwards(&self) -> Option<&dyn Forwards> {
         Some(self)
     }
 }
@@ -290,6 +294,49 @@ impl Snapshots for Qemu {
             _ => qmp::job(&vm.path("qmp.sock"), "snapshot-delete", json!({ "tag": name, "devices": [node_name(vm)?] })),
         }
     }
+}
+
+/// Forwards on the user-mode network (`net0` in `argv`), through the human monitor: QMP has no
+/// commands of its own for them.
+impl Forwards for Qemu {
+    fn add(&self, vm: &Vm, host: u16, guest: u16) -> Result<()> {
+        // Says nothing when it works.
+        let reply = hmp(vm, &format!("hostfwd_add net0 tcp:127.0.0.1:{host}-:{guest}"))?;
+        ensure!(reply.is_empty(), "QEMU: {reply}");
+        Ok(())
+    }
+
+    fn remove(&self, vm: &Vm, host: u16) -> Result<()> {
+        // "host forwarding rule for tcp:127.0.0.1:8080 removed", or why not.
+        let reply = hmp(vm, &format!("hostfwd_remove net0 tcp:127.0.0.1:{host}"))?;
+        ensure!(reply.ends_with("removed"), "QEMU: {reply}");
+        Ok(())
+    }
+
+    fn active(&self, vm: &Vm) -> Result<Vec<(u16, u16)>> {
+        Ok(host_forwards(&hmp(vm, "info usernet")?))
+    }
+}
+
+/// Run a human monitor command and return what it printed.
+fn hmp(vm: &Vm, command: &str) -> Result<String> {
+    let reply = qmp::call_with(&vm.path("qmp.sock"), "human-monitor-command", json!({ "command-line": command }))?;
+    Ok(reply.as_str().unwrap_or_default().trim().to_string())
+}
+
+/// The TCP host forwards in `info usernet`, as (host, guest) ports:
+/// `  TCP[HOST_FORWARD]  12  127.0.0.1  8080  10.0.2.15  80  0  0`
+fn host_forwards(usernet: &str) -> Vec<(u16, u16)> {
+    usernet
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.first() != Some(&"TCP[HOST_FORWARD]") {
+                return None;
+            }
+            Some((fields.get(3)?.parse().ok()?, fields.get(5)?.parse().ok()?))
+        })
+        .collect()
 }
 
 fn qemu_img() -> Result<Command> {
@@ -602,6 +649,20 @@ mod tests {
         vm.dir = "/Users/a,b/.vx/vms/dev".into();
         let argv = argv(&vm, &host(Os::Macos, Arch::Aarch64, Ok("hvf")));
         assert_eq!(value(&argv, "-pidfile"), Some("/Users/a,,b/.vx/vms/dev/qemu.pid"));
+    }
+
+    #[test]
+    fn usernet_forwards() {
+        let usernet = "\
+Hub -1 (net0):
+  Protocol[State]    FD  Source Address  Port   Dest. Address  Port RecvQ SendQ
+  TCP[HOST_FORWARD]  13       127.0.0.1  8080       10.0.2.15    80     0     0
+  TCP[HOST_FORWARD]  12       127.0.0.1  2222       10.0.2.15    22     0     0
+  TCP[ESTABLISHED]   22       127.0.0.1 61234       10.0.2.15    22     0     0
+  UDP[236 sec]       28       10.0.2.15 68        10.0.2.2    67     0     0
+";
+        assert_eq!(host_forwards(usernet), [(8080, 80), (2222, 22)]);
+        assert!(host_forwards("").is_empty());
     }
 
     #[test]
