@@ -57,6 +57,15 @@ impl Colors {
         self.paint("1", text)
     }
 
+    pub fn blue<T: Display>(self, text: T) -> Paint<T> {
+        self.paint("94", text)
+    }
+
+    /// Bold black on cyan: a label that stands out, e.g. the snapshot a VM came from.
+    pub fn label_here<T: Display>(self, text: T) -> Paint<T> {
+        self.paint("1;30;46", text)
+    }
+
     /// `error:`, `warning:` and `hint:` labels.
     pub fn label<T: Display>(self, kind: Label, text: T) -> Paint<T> {
         self.paint(

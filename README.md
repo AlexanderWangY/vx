@@ -32,7 +32,7 @@ Run `vx` with no arguments.
 
 ![VMs](assets/dashboard_ss.jpg)
 
-`⏎` ssh · `s` start · `x` stop · `p` pause · `n` new · `d` delete · `t` snapshots · `tab` images · `?` all keys
+`⏎` ssh · `s` start · `x` stop · `p` pause · `n` new · `d` delete · `S` snapshots · `tab` images · `?` all keys
 
 On a terminal at least 120 columns wide, the selected VM's details sit on the right: live CPU (overall and per core), memory, swap, disk and network from inside the guest, read over SSH with nothing to install. `i` hides or shows them.
 
@@ -58,22 +58,23 @@ Leave out the VM name and you get a picker.
 
 ```
 vx snap dev before-upgrade -m "known good"   # save it as it is now
-vx snap ls dev                               # the history, as a tree
+vx snap ls dev                               # list them
 vx snap restore dev before-upgrade           # go back
 vx snap rm dev before-upgrade
 ```
 
-A running VM's memory is saved too, so restoring puts it back exactly where it was, processes and all. Restore an older snapshot and save again, and you've started a branch. `vx snap ls` keeps the line to where the VM is now straight down the left, with everything else branching off it:
+Think of snapshots as save slots: each is the whole VM at one moment, and going back to one or deleting one never touches the others. A running VM's memory is saved too, so going back puts it exactly where it was, processes and all.
 
 ```
-○ fresh       2d ago                    first boot
-● deps        2d ago  +545 MB memory    toolchains
-├─● try-nix   1d ago  +547 MB memory
-● k8s         5h ago  +547 MB memory    kind cluster up
-◉ now         running
+fresh       2d ago      disk only  clean install
+deps        2d ago  545 MB memory  toolchains
+try-nix     1d ago  547 MB memory
+k8s         5h ago  547 MB memory  from deps · kind cluster up
 ```
 
-In the dashboard, `t` opens the selected VM's tree: `c` saves, `⏎` restores, `space` unfolds a branch. Snapshots live inside the VM's disk, so `vx rm` takes them with it.
+The one the VM came from is highlighted. `from deps` appears only after going back: when a snapshot wasn't saved right after the one above it.
+
+In the dashboard, `S` opens the selected VM's snapshots and `ctrl-s` saves one right away. Snapshots live inside the VM's disk, so `vx rm` takes them with it.
 
 ## Images
 

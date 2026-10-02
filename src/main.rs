@@ -109,9 +109,9 @@ struct SnapArgs {
 
 #[derive(Subcommand)]
 enum SnapCommand {
-    /// Show a VM's snapshots as a tree
+    /// List a VM's snapshots
     Ls { vm: Option<String> },
-    /// Put a VM back how it was at a snapshot
+    /// Go back to a snapshot; the others are kept
     Restore {
         vm: String,
         snapshot: String,
@@ -472,35 +472,43 @@ fn snap_ls(vm: &Vm) -> Result<()> {
         println!("{} has no snapshots yet; take one with `vx snap {}`", vm.name, vm.name);
         return Ok(());
     }
-    let rows = history.rows(&|_| true);
-    let label = |row: &snapshot::Row| match row.at {
-        snapshot::At::Snapshot(i) => {
-            let e = &history.entries[i];
-            format!("{}{} {}", row.graph, snapshot::marker(e), e.snap.name)
-        }
-        snapshot::At::Now => format!("{}{} now", row.graph, snapshot::NOW),
-    };
-    let w = rows.iter().map(|r| label(r).chars().count()).max().unwrap_or(0);
-    let state = backend::get(&vm.spec.backend)?.state(vm);
-    for row in &rows {
-        let text = label(row);
-        let pad = " ".repeat(w - text.chars().count());
-        match row.at {
-            snapshot::At::Snapshot(i) => {
-                let e = &history.entries[i];
-                let memory = match e.snap.memory {
-                    0 => String::new(),
-                    n => format!("+{} memory", progress::bytes(n)),
-                };
-                let when = OUT.dim(format!("{:>8}", snapshot::ago(e.snap.created)));
-                let line = format!("{text}{pad}  {when}  {:16}  {}", OUT.dim(memory), e.note);
-                println!("{}", line.trim_end());
-            }
-            snapshot::At::Now => println!("{}{pad}  {}", OUT.cyan(text), OUT.dim(state.to_string())),
-        }
+    let name_w = history.entries.iter().map(|e| e.snap.name.chars().count()).max().unwrap_or(0);
+    for (i, e) in history.entries.iter().enumerate() {
+        let marker = snapshot::marker(e);
+        let marker = if e.snap.memory > 0 { OUT.green(marker).to_string() } else { OUT.blue(marker).to_string() };
+        let here = history.current.as_deref() == Some(e.snap.name.as_str());
+        let label = format!(" {} ", e.snap.name);
+        let pad = " ".repeat(name_w - e.snap.name.chars().count());
+        let name = if here { format!("{}{pad}", OUT.label_here(label)) } else { format!("{label}{pad}") };
+        let memory = match e.snap.memory {
+            0 => "disk only".to_string(),
+            n => format!("{} memory", progress::bytes(n)),
+        };
+        let when = format!("{:>8}", snapshot::ago(e.snap.created));
+        // Where it was saved from, when that isn't the line above: after going back.
+        let note = match (history.from(i), e.note.as_str()) {
+            (Some(from), "") => OUT.dim(format!("from {from}")).to_string(),
+            (Some(from), note) => format!("{} {note}", OUT.dim(format!("from {from} ·"))),
+            (None, note) => note.to_string(),
+        };
+        let line = format!("{marker}{name} {}  {}  {note}", OUT.dim(when), OUT.dim(format!("{memory:>13}")));
+        println!("{}", line.trim_end());
     }
     println!();
-    println!("{}", OUT.dim("● memory and disk  ○ disk only  ◉ where the VM is now"));
+    let state = backend::get(&vm.spec.backend)?.state(vm);
+    match &history.current {
+        Some(at) => {
+            println!("{} came from {} {}", vm.name, OUT.label_here(format!(" {at} ")), OUT.dim(format!("({state})")))
+        }
+        None => println!("{} isn't from any of them {}", vm.name, OUT.dim(format!("({state})"))),
+    }
+    println!(
+        "{} {}   {} {}",
+        OUT.green('●'),
+        OUT.dim("resumes running: memory saved"),
+        OUT.blue('○'),
+        OUT.dim("boots from disk: disk only")
+    );
     Ok(())
 }
 
@@ -510,9 +518,9 @@ fn snap_restore(vm: &Vm, name: &str, yes: bool) -> Result<()> {
     let entry = history.find(vm, name)?.clone();
     if !yes {
         let question = format!(
-            "restore {} to {}? what it has now is lost unless you snapshot it first",
+            "go back to {} in {}? what it has now is lost unless you snapshot it first; other snapshots are kept",
+            ERR.bold(name),
             ERR.bold(&vm.name),
-            ERR.bold(name)
         );
         let why = format!("not restoring {} without confirmation", vm.name);
         if !ask(&question, why, format!("vx snap restore -y {} {name}", vm.name))? {
