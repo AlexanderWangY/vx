@@ -2,15 +2,15 @@
 //! whose state refreshes every second, and a table of images.
 //!
 //! On a wide enough terminal, the selected VM's details sit to the right of the table, with live
-//! CPU, memory, disk and network numbers from inside it while it runs (see `stats`). `t` swaps
-//! the table for the VM's snapshot tree (see `snapshot`) until Esc.
+//! CPU, memory, disk and network numbers from inside it while it runs (see `stats`). `S` swaps
+//! the table for the VM's snapshot history (see `snapshot`) until Esc.
 //!
 //! Actions run the CLI itself as a child process, so they share its locks, checks and messages:
 //! most in the background with their output captured, and the interactive ones (ssh, console,
 //! logs) in the foreground with the dashboard set aside until they end. Creating a VM and adding
 //! an image use forms drawn in the dashboard.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -40,7 +40,7 @@ use crate::form::{AddImageForm, NewForm, NewImage, NewSnap, SnapForm, Step};
 use crate::host::Arch;
 use crate::image::{self, Info};
 use crate::progress::bytes;
-use crate::snapshot::{self, At, History};
+use crate::snapshot::{self, Cell as GraphCell, History};
 use crate::stats::{Sample, Stats, Watcher};
 use crate::style::{self, ERR, OUT};
 use crate::vx::{Home, Spec};
@@ -390,11 +390,10 @@ struct App {
     history: Option<(String, Result<History, String>)>,
     /// The VM in the snapshot view.
     snap_vm: String,
-    /// The selected row there: a snapshot, or `None` for where the VM is now.
+    /// The snapshot selected there; `None` until one is picked, which means the one the VM is
+    /// at (see `snap_pick`).
     snap_selected: Option<String>,
     snap_table: TableState,
-    /// Branches unfolded there.
-    snap_open: HashSet<String>,
 }
 
 impl App {
@@ -420,7 +419,6 @@ impl App {
             snap_vm: String::new(),
             snap_selected: None,
             snap_table: TableState::default(),
-            snap_open: HashSet::new(),
         }
     }
 
@@ -558,22 +556,24 @@ impl App {
 
     /// The snapshot view's rows, as drawn.
     fn snap_rows(&self) -> Vec<snapshot::Row> {
-        self.snap_history().map(|h| h.rows(&|name| self.snap_open.contains(name))).unwrap_or_default()
+        self.snap_history().map(History::rows).unwrap_or_default()
     }
 
-    /// The index of the selected row in `rows`.
-    fn snap_index(&self, rows: &[snapshot::Row]) -> Option<usize> {
+    /// The selected snapshot: the one picked, else the one the VM is at, else the newest.
+    fn snap_pick(&self) -> Option<&snapshot::Entry> {
         let h = self.snap_history()?;
-        rows.iter().position(|row| match (row.at, &self.snap_selected) {
-            (At::Now, None) => true,
-            (At::Snapshot(i), Some(name)) => &h.entries[i].snap.name == name,
-            _ => false,
-        })
+        let picked = self.snap_selected.as_deref().and_then(|name| h.get(name));
+        picked.or_else(|| h.current.as_deref().and_then(|name| h.get(name))).or_else(|| h.entries.last())
+    }
+
+    /// The index of the selected snapshot's row in `rows`.
+    fn snap_index(&self, rows: &[snapshot::Row]) -> Option<usize> {
+        let (h, pick) = (self.snap_history()?, self.snap_pick()?);
+        rows.iter().position(|row| row.node.is_some_and(|i| h.entries[i].snap.name == pick.snap.name))
     }
 
     fn open_snapshots(&mut self, name: String) {
         if self.snap_vm != name {
-            self.snap_open.clear();
             self.snap_table = TableState::default();
         }
         self.snap_selected = None;
@@ -745,7 +745,7 @@ impl App {
                         args.extend(["-m".into(), note]);
                     }
                     self.snap_selected = None;
-                    return self.snap_job(Verb::Snapshot, args, None, format!("✓ saved {vm} as {name}"));
+                    return self.snap_job(vm.clone(), Verb::Snapshot, args, None, format!("✓ saved {vm} as {name}"));
                 }
                 Step::Cancel => {}
                 Step::Continue => self.modal = Some(Modal::Snap(form)),
@@ -757,13 +757,13 @@ impl App {
                 match key.code {
                     KeyCode::Char('y' | 'Y') => {
                         self.snap_selected = None;
-                        return self.snap_job(Verb::Restore, restore, None, done);
+                        return self.snap_job(vm, Verb::Restore, restore, None, done);
                     }
-                    // Snapshot what it has now, then restore.
+                    // Snapshot what it has now, then go back.
                     KeyCode::Char('s' | 'S') => {
                         let save = vec!["snap".to_string(), vm.clone()];
                         self.snap_selected = None;
-                        return self.snap_job(Verb::Restore, save, Some(restore), done);
+                        return self.snap_job(vm, Verb::Restore, save, Some(restore), done);
                     }
                     KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {}
                     _ => self.modal = Some(Modal::Restore(name)),
@@ -773,7 +773,8 @@ impl App {
                 Some(true) => {
                     let vm = self.snap_vm.clone();
                     let args = vec!["snap".into(), "rm".into(), "-y".into(), vm.clone(), name.clone()];
-                    return self.snap_job(Verb::DeleteSnapshot, args, None, format!("✓ deleted {name} from {vm}"));
+                    let done = format!("✓ deleted {name} from {vm}");
+                    return self.snap_job(vm, Verb::DeleteSnapshot, args, None, done);
                 }
                 Some(false) => {}
                 None => self.modal = Some(Modal::DeleteSnapshot(name, after)),
@@ -787,11 +788,17 @@ impl App {
         if navigate(&mut self.table, key.code, len) {
             return Action::None;
         }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('n') => self.open_new(None),
-            KeyCode::Char('t') => {
+            KeyCode::Char('S') => {
                 if let Some((name, _)) = self.target() {
                     self.open_snapshots(name);
+                }
+            }
+            KeyCode::Char('s') if ctrl => {
+                if let Some((name, _)) = self.target() {
+                    return self.quick_snap(name);
                 }
             }
             KeyCode::Char('i') => {
@@ -842,65 +849,68 @@ impl App {
         Action::None
     }
 
-    /// A job on the snapshot view's VM, which shows as busy until it ends.
-    fn snap_job(&mut self, verb: Verb, args: Vec<String>, then: Option<Vec<String>>, done: String) -> Action {
-        let target = Target::Vm(self.snap_vm.clone());
+    /// A job on VM `vm`, which shows as busy until it ends and then says `done`.
+    fn snap_job(
+        &mut self,
+        vm: String,
+        verb: Verb,
+        args: Vec<String>,
+        then: Option<Vec<String>>,
+        done: String,
+    ) -> Action {
+        let target = Target::Vm(vm);
         self.busy.insert(target.clone(), Busy { verb, done: false, pending: None });
         Action::Job(Job { target, verb, args, then, done: Some(done) })
     }
 
+    /// Save a snapshot of `vm` right away, under the next free `snap-N` name.
+    fn quick_snap(&mut self, vm: String) -> Action {
+        let mut args = vec!["snap".to_string(), vm.clone()];
+        let done = match self.history_of(&vm).map(History::next_name) {
+            Some(name) => {
+                args.push(name.clone());
+                format!("✓ saved {vm} as {name}")
+            }
+            None => format!("✓ saved a snapshot of {vm}"),
+        };
+        self.snap_job(vm, Verb::Snapshot, args, None, done)
+    }
+
     fn snap_key(&mut self, key: KeyEvent) -> Action {
+        let vm = self.snap_vm.clone();
         let rows = self.snap_rows();
         let Some(history) = self.snap_history() else { return Action::None };
-        let index = self.snap_index(&rows);
-        let name_at = |i: usize| match rows[i].at {
-            At::Snapshot(e) => Some(history.entries[e].snap.name.clone()),
-            At::Now => None,
-        };
+        // Only snapshots can be selected, not the forks between them.
+        let nodes: Vec<usize> = rows.iter().filter_map(|r| r.node).collect();
+        let at = self.snap_pick().and_then(|p| nodes.iter().position(|&i| history.entries[i].snap.name == p.snap.name));
         let moved = match key.code {
-            KeyCode::Up | KeyCode::Char('k') => index.map(|i| i.saturating_sub(1)),
-            KeyCode::Down | KeyCode::Char('j') => index.map(|i| (i + 1).min(rows.len() - 1)),
+            _ if nodes.is_empty() => None,
+            KeyCode::Up | KeyCode::Char('k') => at.map(|i| i.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => at.map(|i| (i + 1).min(nodes.len() - 1)),
             KeyCode::Home | KeyCode::Char('g') => Some(0),
-            KeyCode::End | KeyCode::Char('G') => Some(rows.len() - 1),
+            KeyCode::End | KeyCode::Char('G') => Some(nodes.len() - 1),
             _ => None,
         };
         if let Some(i) = moved {
-            self.snap_selected = name_at(i);
+            self.snap_selected = Some(history.entries[nodes[i]].snap.name.clone());
             return Action::None;
         }
-        let selected = index.map(|i| (rows[i].clone(), name_at(i)));
-        let fold = selected.as_ref().and_then(|(row, name)| Some((row.fold?, name.clone()?)));
-        let after = self.snap_selected.as_deref().map_or(0, |n| history.descendants(n));
+        let pick = self.snap_pick().map(|p| p.snap.name.clone());
+        let after = pick.as_deref().map_or(0, |n| history.descendants(n));
         let taken: Vec<String> = history.entries.iter().map(|e| e.snap.name.clone()).collect();
         let suggested = history.next_name();
-        let vm = self.snap_vm.clone();
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if let Some(busy) = self.busy.get(&Target::Vm(vm.clone()))
-            && matches!(key.code, KeyCode::Char('c' | 'd') | KeyCode::Enter)
+            && matches!(key.code, KeyCode::Char('c' | 'd' | 's') | KeyCode::Enter)
         {
             self.say(format!("{vm} is busy {}", busy.verb.doing()), WARN);
             return Action::None;
         }
-        match (key.code, self.snap_selected.clone()) {
-            (KeyCode::Char(' ') | KeyCode::Right | KeyCode::Left | KeyCode::Char('l' | 'h'), _) => {
-                if let Some((fold, name)) = fold {
-                    let open = match key.code {
-                        KeyCode::Right | KeyCode::Char('l') => true,
-                        KeyCode::Left | KeyCode::Char('h') => false,
-                        _ => !fold.open,
-                    };
-                    if open {
-                        self.snap_open.insert(name);
-                    } else {
-                        self.snap_open.remove(&name);
-                    }
-                }
-            }
+        match (key.code, pick) {
+            (KeyCode::Char('s'), _) if ctrl => return self.quick_snap(vm),
             (KeyCode::Char('c'), _) => self.modal = Some(Modal::Snap(Box::new(SnapForm::new(&vm, &suggested, taken)))),
             (KeyCode::Enter, Some(name)) => self.modal = Some(Modal::Restore(name)),
             (KeyCode::Char('d'), Some(name)) => self.modal = Some(Modal::DeleteSnapshot(name, after)),
-            (KeyCode::Enter | KeyCode::Char('d'), None) => {
-                self.say("that's where the VM is now; pick a snapshot".into(), DIM)
-            }
             _ => {}
         }
         Action::None
@@ -960,7 +970,7 @@ impl App {
             .border_style(BORDER)
             .title(self.title(room))
             .title(counts.right_aligned())
-            .title_bottom(self.hints());
+            .title_bottom(self.hints(area.width));
         if self.error.is_some() && self.view == View::Vms {
             block = block.border_style(Style::new().fg(Color::Red));
         }
@@ -1016,6 +1026,10 @@ impl App {
                 }
                 _ if self.snap_history().is_none() => {
                     frame.render_widget(Paragraph::new(Line::styled("loading…", DIM)), body);
+                    0
+                }
+                _ if self.snap_history().is_some_and(|h| h.entries.is_empty()) => {
+                    draw_no_snapshots(frame, body, &self.snap_vm);
                     0
                 }
                 _ => {
@@ -1084,22 +1098,15 @@ impl App {
             }
             Some(Modal::Restore(name)) => {
                 let what = vec![
-                    Span::raw("Restore "),
+                    Span::raw("Take "),
                     Span::styled(self.snap_vm.clone(), HEADER),
-                    Span::raw(" to "),
+                    Span::raw(" back to "),
                     Span::styled(name.clone(), HEADER),
                     Span::raw("?"),
                 ];
-                let keys = [("y", "restore"), ("s", "snapshot first, then restore"), ("n", "cancel")];
-                draw_ask(
-                    frame,
-                    area,
-                    "restore",
-                    WARN,
-                    what,
-                    "What it has now is lost unless you snapshot it first.",
-                    &keys,
-                );
+                let note = "What it has now is lost unless you save it first. Other snapshots are kept.";
+                let keys = [("y", "go back"), ("s", "save first, then go back"), ("n", "cancel")];
+                draw_ask(frame, area, "go back", WARN, what, note, &keys);
             }
             Some(Modal::DeleteSnapshot(name, after)) => {
                 let what = vec![Span::raw("Delete snapshot "), Span::styled(name.clone(), HEADER), Span::raw("?")];
@@ -1180,8 +1187,8 @@ impl App {
         Line::from(spans)
     }
 
-    /// Keys for what the selection can do, in the bottom border.
-    fn hints(&self) -> Line<'static> {
+    /// Keys for what the selection can do, in the bottom border `width` wide.
+    fn hints(&self, width: u16) -> Line<'static> {
         let mut spans = vec![Span::styled("─ ", BORDER)];
         let mut keys: Vec<(&str, &str)> = Vec::new();
         match self.view {
@@ -1197,6 +1204,8 @@ impl App {
                         State::Paused => keys.extend([("p", "resume"), ("x", "stop")]),
                         _ => keys.extend([("x", "stop"), ("p", "pause")]),
                     }
+                    // The short label when the full one would push `q quit` off an 80-column screen.
+                    keys.push(("S", if width >= 90 { "snapshots" } else { "snaps" }));
                 }
                 _ => {}
             },
@@ -1213,15 +1222,10 @@ impl App {
                 keys.push(("a", "add"));
             }
             View::Snapshots => {
-                if self.snap_selected.is_some() {
-                    keys.extend([("⏎", "restore"), ("d", "delete")]);
+                if self.snap_pick().is_some() {
+                    keys.extend([("⏎", "go back to it"), ("d", "delete")]);
                 }
-                keys.push(("c", "snapshot"));
-                let rows = self.snap_rows();
-                if self.snap_index(&rows).is_some_and(|i| rows[i].fold.is_some()) {
-                    keys.push(("space", "fold"));
-                }
-                keys.push(("esc", "back"));
+                keys.extend([("c", "save"), ("esc", "back")]);
             }
         }
         if self.view == View::Vms {
@@ -1327,12 +1331,8 @@ impl App {
                 lines.push(field("file", format!("{} on host", bytes(disk))));
             }
             if let Some(h) = self.history_of(&entry.name) {
-                let snaps = match (h.entries.len(), &h.current) {
-                    (0, _) => "none yet · t to take one".to_string(),
-                    (n, Some(at)) => format!("{n} · at {at} · t to browse"),
-                    (n, None) => format!("{n} · t to browse"),
-                };
-                lines.push(field("snaps", snaps));
+                lines.push(Line::default());
+                lines.extend(recent_snapshots(h, width));
             }
             lines.push(Line::default());
             let Some(stats) = stats else {
@@ -1405,55 +1405,60 @@ impl App {
         frame.render_widget(Paragraph::new(lines(cpu_rows, net_rows)), inner);
     }
 
-    /// The snapshot tree, one row per line of `rows`.
+    /// The snapshot history, one row per line of `rows`. The snapshot the VM is at is
+    /// highlighted.
     fn snap_table(&self, rows: &[snapshot::Row], spinner: char) -> Table<'static> {
         let Some(h) = self.snap_history() else { return Table::default() };
         let selected = self.snap_table.selected();
         let right = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
+        let busy = self.vm_busy_label(&self.snap_vm);
         let mut label_width = 8;
         let table_rows: Vec<Row> = rows
             .iter()
             .enumerate()
-            .map(|(i, row)| {
-                let text = if selected == Some(i) { SELECTED_TEXT } else { Style::new() };
-                let mut label = vec![Span::styled(row.graph.clone(), BORDER)];
-                if let Some(fold) = row.fold {
-                    label.push(Span::styled(if fold.open { "▾" } else { "▸" }, ACCENT));
-                }
-                let cells = match row.at {
-                    At::Snapshot(e) => {
-                        let entry = &h.entries[e];
-                        let marker = snapshot::marker(entry);
-                        label.push(Span::styled(format!("{marker} "), if entry.snap.memory > 0 { OK } else { DIM }));
-                        label.push(Span::raw(clip(&entry.snap.name, 24)));
-                        if let Some(fold) = row.fold.filter(|f| !f.open) {
-                            label.push(Span::styled(format!(" +{}", fold.hidden), DIM));
-                        }
-                        let memory = match entry.snap.memory {
-                            0 => Span::styled("disk", DIM),
-                            n => Span::raw(bytes(n)),
-                        };
-                        vec![
-                            right(snapshot::ago(entry.snap.created)),
-                            Cell::from(Line::from(memory).alignment(Alignment::Right)),
-                            Cell::from(Span::styled(entry.note.clone(), DIM)),
-                        ]
-                    }
-                    At::Now => {
-                        label.push(Span::styled(format!("{} now", snapshot::NOW), ACCENT));
-                        let state = match self.vm_busy_label(&self.snap_vm) {
-                            Some(busy) => Span::styled(format!("{spinner} {busy}"), BUSY),
-                            None => match self.vm_state(&self.snap_vm) {
-                                Some(state) => Span::styled(state.to_string(), DIM),
-                                None => Span::raw(""),
-                            },
-                        };
-                        vec![Cell::from(""), Cell::from(""), Cell::from(state)]
-                    }
+            .map(|(r, row)| {
+                let text = if selected == Some(r) { SELECTED_TEXT } else { Style::new() };
+                let Some(i) = row.node else {
+                    let graph: String = row.cells.iter().map(|c| c.text(' ')).collect();
+                    return Row::new(vec![Cell::from(Span::styled(graph, BORDER))]);
                 };
+                let entry = &h.entries[i];
+                let here = h.current.as_deref() == Some(entry.snap.name.as_str());
+                let mut label = Vec::new();
+                for cell in &row.cells {
+                    label.push(match cell {
+                        GraphCell::Node => {
+                            let style = if here {
+                                ACCENT
+                            } else if entry.snap.memory > 0 {
+                                OK
+                            } else {
+                                DIM
+                            };
+                            Span::styled(cell.text(snapshot::marker(entry)), style)
+                        }
+                        _ => Span::styled(cell.text(' '), BORDER),
+                    });
+                }
+                label.push(Span::styled(clip(&entry.snap.name, 24), if here { ACCENT } else { Style::new() }));
                 let label = Line::from(label);
                 label_width = label_width.max(label.width());
-                Row::new([vec![Cell::from(label)], cells].concat()).style(text)
+                let memory = match entry.snap.memory {
+                    0 => Span::styled("disk", DIM),
+                    n => Span::raw(bytes(n)),
+                };
+                // While a job runs, it shows on the row the VM is at.
+                let note = match &busy {
+                    Some(busy) if here => Span::styled(format!("{spinner} {busy}"), BUSY),
+                    _ => Span::styled(entry.note.clone(), DIM),
+                };
+                Row::new(vec![
+                    Cell::from(label),
+                    right(snapshot::ago(entry.snap.created)),
+                    Cell::from(Line::from(memory).alignment(Alignment::Right)),
+                    Cell::from(note),
+                ])
+                .style(text)
             })
             .collect();
         let widths = [
@@ -1472,11 +1477,12 @@ impl App {
         self.vms.iter().flatten().find(|e| e.name == name).and_then(|e| e.vm.as_ref().ok()).map(|(_, state)| state)
     }
 
-    /// The selected snapshot, or where the VM is now, in the details pane.
+    /// The selected snapshot in the details pane.
     fn draw_snap_details(&self, frame: &mut Frame, area: Rect, spinner: char) {
         let Some(h) = self.snap_history() else { return };
-        let entry = self.snap_selected.as_deref().and_then(|name| h.get(name));
-        let name = entry.map_or("now".to_string(), |e| e.snap.name.clone());
+        let vm = &self.snap_vm;
+        let entry = self.snap_pick();
+        let name = entry.map_or(vm.clone(), |e| e.snap.name.clone());
         let title = Line::from(vec![
             Span::styled("─ ", BORDER),
             Span::styled(clip(&name, area.width.saturating_sub(6) as usize), ACCENT),
@@ -1489,58 +1495,46 @@ impl App {
         let field = |key: &str, value: String| {
             Line::from(vec![Span::styled(format!("{key:7}"), DIM), Span::raw(clip(&value, width.saturating_sub(7)))])
         };
+        let state = match self.vm_busy_label(vm) {
+            Some(busy) => Line::styled(format!("{spinner} {busy}"), BUSY),
+            None => self.vm_state(vm).map(state_line).unwrap_or_default(),
+        };
         let mut lines = Vec::new();
-        match entry {
-            Some(e) => {
-                let (marker, kind) = match e.snap.memory {
-                    0 => (Span::styled("○ ", DIM), "disk only".to_string()),
-                    n => (Span::styled("● ", OK), format!("memory and disk · {} of memory", bytes(n))),
-                };
-                lines.push(Line::from(vec![marker, Span::raw(kind)]));
-                lines.push(Line::default());
-                lines.push(field(
-                    "saved",
-                    format!("{} · {}", snapshot::ago(e.snap.created), local_time(e.snap.created)),
-                ));
-                lines.push(field("after", e.parent.clone().unwrap_or_else(|| "nothing: it's a first".into())));
-                let later = h.descendants(&e.snap.name);
-                if later > 0 {
-                    lines.push(field("later", format!("{later} snapshot{}", if later == 1 { "" } else { "s" })));
-                }
-                if h.current.as_deref() == Some(e.snap.name.as_str()) {
-                    lines.push(field("", "the VM is here now".into()));
-                }
-                if !e.note.is_empty() {
-                    lines.push(Line::default());
-                    lines.push(Line::raw(e.note.clone()));
-                }
-                lines.push(Line::default());
-                let restore = if e.snap.memory > 0 {
-                    "restoring resumes it right where it was"
-                } else {
-                    "restoring boots it from this disk"
-                };
-                lines.push(Line::styled(restore, DIM));
-            }
-            None => {
-                let state = match self.vm_busy_label(&self.snap_vm) {
-                    Some(busy) => Line::styled(format!("{spinner} {busy}"), BUSY),
-                    None => self.vm_state(&self.snap_vm).map(state_line).unwrap_or_default(),
-                };
-                lines.push(state);
-                lines.push(Line::default());
-                match &h.current {
-                    Some(at) => lines.push(field("from", at.clone())),
-                    None => lines.push(Line::styled("no snapshots yet", DIM)),
-                }
-                lines.push(Line::default());
-                let tip = match self.vm_state(&self.snap_vm) {
-                    Some(State::Running) => "c saves its memory and disk",
-                    _ => "c saves its disk",
-                };
-                lines.push(Line::styled(tip, DIM));
-            }
+        let Some(e) = entry else {
+            lines.extend([state, Line::default(), Line::styled("no snapshots yet", DIM)]);
+            frame.render_widget(Paragraph::new(lines), inner);
+            return;
+        };
+        if h.current.as_deref() == Some(e.snap.name.as_str()) {
+            let mut here = vec![Span::styled(format!("{vm} is here · "), ACCENT)];
+            here.extend(state.spans);
+            lines.push(Line::from(here));
+        } else {
+            lines.push(Line::styled(format!("{vm} isn't here"), DIM));
         }
+        lines.push(Line::default());
+        let kind = match e.snap.memory {
+            0 => "disk only".to_string(),
+            n => format!("memory and disk · {} of memory", bytes(n)),
+        };
+        lines.push(field("saved", kind));
+        lines.push(field("", format!("{} · {}", snapshot::ago(e.snap.created), local_time(e.snap.created))));
+        lines.push(field("from", e.parent.clone().unwrap_or_else(|| "the start".into())));
+        let later = h.descendants(&e.snap.name);
+        if later > 0 {
+            lines.push(field("later", format!("{later} snapshot{}", if later == 1 { "" } else { "s" })));
+        }
+        if !e.note.is_empty() {
+            lines.push(Line::default());
+            lines.push(Line::raw(e.note.clone()));
+        }
+        lines.push(Line::default());
+        let back = if e.snap.memory > 0 {
+            "going back resumes it right where it was"
+        } else {
+            "going back boots it from this disk"
+        };
+        lines.push(Line::styled(back, DIM));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
@@ -1903,6 +1897,55 @@ fn clip(text: &str, max: usize) -> String {
     clipped
 }
 
+/// The VM pane's snapshot section: the newest few, with the one the VM is at highlighted.
+fn recent_snapshots(h: &History, width: usize) -> Vec<Line<'static>> {
+    const SHOWN: usize = 3;
+    let mut lines = vec![heading("SNAPSHOTS", h.entries.len().to_string(), width)];
+    if h.entries.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("none yet · ", DIM),
+            Span::styled("ctrl-s", ACCENT),
+            Span::styled(" saves one", DIM),
+        ]));
+        return lines;
+    }
+    for e in h.entries.iter().rev().take(SHOWN) {
+        let here = h.current.as_deref() == Some(e.snap.name.as_str());
+        let when = snapshot::ago(e.snap.created);
+        let name = clip(&e.snap.name, width.saturating_sub(when.chars().count() + 3));
+        let pad = width.saturating_sub(2 + name.chars().count() + when.chars().count());
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} ", snapshot::marker(e)), if here { ACCENT } else { DIM }),
+            Span::styled(name, if here { ACCENT } else { Style::new() }),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(when, DIM),
+        ]));
+    }
+    let more = h.entries.len().saturating_sub(SHOWN);
+    let mut hint = vec![Span::styled("S", ACCENT), Span::styled(" all", DIM)];
+    if more > 0 {
+        hint.push(Span::styled(format!(" ({more} more)"), DIM));
+    }
+    hint.extend([Span::styled(" · ", DIM), Span::styled("ctrl-s", ACCENT), Span::styled(" save one", DIM)]);
+    lines.push(Line::from(hint));
+    lines
+}
+
+fn draw_no_snapshots(frame: &mut Frame, area: Rect, vm: &str) {
+    let [_, middle, _] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(3), Constraint::Fill(2)]).areas(area);
+    let text = vec![
+        Line::from(format!("{vm} has no snapshots yet")).alignment(Alignment::Center),
+        Line::from(vec![
+            Span::styled("press ", DIM),
+            Span::styled("c", ACCENT),
+            Span::styled(" to save one, so you can come back to this moment", DIM),
+        ])
+        .alignment(Alignment::Center),
+    ];
+    frame.render_widget(Paragraph::new(text), middle);
+}
+
 fn draw_empty(frame: &mut Frame, area: Rect) {
     let [_, middle, _] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(2), Constraint::Fill(2)]).areas(area);
@@ -1943,7 +1986,8 @@ const HELP: [&[(&str, &str)]; 2] = [
         ("n", "new VM"),
         ("d", "delete"),
         ("i", "show or hide details"),
-        ("t", "snapshots"),
+        ("S", "snapshots"),
+        ("ctrl-s", "save a snapshot now"),
         ("", ""),
         ("", "images"),
         ("⏎", "new VM from it"),
@@ -1953,10 +1997,9 @@ const HELP: [&[(&str, &str)]; 2] = [
     ],
     &[
         ("", "snapshots"),
-        ("c", "save one"),
-        ("⏎", "restore it"),
+        ("c", "save one, with a name and note"),
+        ("⏎", "go back to it"),
         ("d", "delete it"),
-        ("space", "fold a branch, or ← →"),
         ("esc", "back to VMs"),
         ("", ""),
         ("tab", "switch between VMs and images"),
@@ -2113,7 +2156,7 @@ mod tests {
 │ web   ○ stopped   fedora-44  aarch64     4      4G  127.0.0.1:2223           │
 │ old   ✗ broken                                                               │
 │                                                                              │
-╰─ ⏎ ssh · x stop · p pause · n new · tab images · ? keys · q quit ────────────╯";
+╰─ ⏎ ssh · x stop · p pause · S snaps · n new · tab images · ? keys · q quit ──╯";
 
     const IMAGE_GOLDEN: &str = "\
 ╭─ vx ─ VMs · images ────────────────────────── 4 images · 2 on disk · 1.3 GB ─╮
@@ -2145,7 +2188,7 @@ mod tests {
     fn hints_follow_the_selection() {
         let mut app = with_vms();
         let _ = app.key(press(KeyCode::Down));
-        assert!(screen(&mut app, 80, 7).contains("⏎ ssh · s start · d delete · n new"));
+        assert!(screen(&mut app, 80, 7).contains("⏎ ssh · s start · d delete · S snaps · n new"));
         let _ = app.key(press(KeyCode::Tab));
         let _ = app.key(press(KeyCode::Down)); // ubuntu-24.04: not downloaded
         assert!(screen(&mut app, 80, 7).contains("⏎ new VM · p download · a add · tab VMs"));
@@ -2357,7 +2400,8 @@ mod tests {
         let mut app = with_vms();
         let _ = app.key(press(KeyCode::Char('?')));
         let text = screen(&mut app, 110, 24);
-        for want in ["─ keys ─", "pause or resume", "download it now", "fold a branch", "quit"] {
+        for want in ["─ keys ─", "pause or resume", "download it now", "save a snapshot now", "go back to it", "quit"]
+        {
             assert!(text.contains(want), "missing {want}:\n{text}");
         }
         assert_eq!(app.key(press(KeyCode::Char('q'))), Action::None); // closes help, doesn't quit
@@ -2460,7 +2504,7 @@ mod tests {
 
     fn snap_view() -> App {
         let mut app = with_vms();
-        let _ = app.key(press(KeyCode::Char('t')));
+        let _ = app.key(press(KeyCode::Char('S')));
         assert_eq!(app.view, View::Snapshots);
         assert_eq!(app.focus().as_deref(), Some("dev"));
         app.update_history(Some(("dev".into(), Ok(snap_history()))));
@@ -2468,26 +2512,33 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_tree_folds_and_selects() {
+    fn snapshot_history_is_a_stable_graph() {
         let mut app = snap_view();
         let text = screen(&mut app, 100, 12);
         assert!(text.contains("vx ─ VMs › dev › snapshots"), "{text}");
         assert!(text.contains("5 snapshots · at k8s"), "{text}");
-        for want in ["○ fresh", "● deps", "├─▸○ try-nix +1", "○ k8s", "◉ now", "529 MB", "kind up"] {
-            assert!(text.contains(want), "missing {want}:\n{text}");
+        for want in ["│ ○   fresh ", "│ ●   deps ", "│ ├─╮ ", "│ ○ │ try-nix ", "│ ○ │ nix-2 ", "│   ○ k8s "]
+        {
+            assert!(text.contains(want), "missing {want:?}:\n{text}");
         }
-        assert!(!text.contains("nix-2"), "folded away:\n{text}");
-        assert!(text.contains("c snapshot · esc back"), "now is selected:\n{text}");
+        assert!(!text.contains("now"), "no row of its own for where the VM is:\n{text}");
 
-        // Up to try-nix, then unfold it.
-        for _ in 0..2 {
+        // The VM is at k8s, so that's selected to start with; up skips the fork row.
+        assert_eq!(app.snap_pick().unwrap().snap.name, "k8s");
+        let _ = app.key(press(KeyCode::Up));
+        assert_eq!(app.snap_pick().unwrap().snap.name, "nix-2");
+        for _ in 0..3 {
             let _ = app.key(press(KeyCode::Up));
         }
-        assert_eq!(app.snap_selected.as_deref(), Some("try-nix"));
-        assert!(screen(&mut app, 100, 12).contains("space fold"));
-        let _ = app.key(press(KeyCode::Char(' ')));
-        let text = screen(&mut app, 100, 12);
-        assert!(text.contains("├─▾○ try-nix") && text.contains("│ ○ nix-2"), "{text}");
+        assert_eq!(app.snap_pick().unwrap().snap.name, "fresh");
+
+        // Going back somewhere else changes the highlight, not the layout.
+        let body = |app: &mut App| screen(app, 100, 12).lines().skip(1).collect::<Vec<_>>().join("\n");
+        let before = body(&mut app);
+        let mut moved = snap_history();
+        moved.current = Some("nix-2".into());
+        app.update_history(Some(("dev".into(), Ok(moved))));
+        assert_eq!(body(&mut app), before);
 
         // Esc goes back to the VMs rather than quitting.
         assert_eq!(app.key(press(KeyCode::Esc)), Action::None);
@@ -2497,13 +2548,14 @@ mod tests {
     #[test]
     fn snapshot_actions_run_the_cli() {
         let mut app = snap_view();
-        let _ = app.key(press(KeyCode::Up)); // k8s
+        let _ = app.key(press(KeyCode::Up)); // nix-2
         let _ = app.key(press(KeyCode::Enter));
-        assert!(screen(&mut app, 100, 16).contains("Restore dev to k8s?"));
-        let restore = job(&mut app, KeyCode::Char('s')).unwrap();
-        assert_eq!(restore.args, ["snap", "dev"], "snapshots first");
-        assert_eq!(restore.then.unwrap(), ["snap", "restore", "-y", "dev", "k8s"]);
-        assert!(screen(&mut app, 100, 16).contains(" restoring"));
+        let text = screen(&mut app, 100, 16);
+        assert!(text.contains("Take dev back to nix-2?") && text.contains("Other snapshots are kept."), "{text}");
+        let back = job(&mut app, KeyCode::Char('s')).unwrap();
+        assert_eq!(back.args, ["snap", "dev"], "saves first");
+        assert_eq!(back.then.unwrap(), ["snap", "restore", "-y", "dev", "nix-2"]);
+        assert!(screen(&mut app, 100, 16).contains(" restoring"), "on the row the VM is at");
         // Busy until it's done.
         let _ = app.key(press(KeyCode::Char('c')));
         assert!(app.modal.is_none());
@@ -2526,16 +2578,35 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_details_and_vm_pane_line() {
+    fn ctrl_s_saves_right_away() {
+        let ctrl_s = KeyEvent { modifiers: KeyModifiers::CONTROL, ..press(KeyCode::Char('s')) };
+        let mut app = with_vms();
+        let _ = screen(&mut app, 130, 20); // the details pane, so its history loads
+        app.update_history(Some(("dev".into(), Ok(snap_history()))));
+        let save = match app.key(ctrl_s) {
+            Action::Job(job) => job,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(save.args, ["snap", "dev", "snap-1"]);
+        assert_eq!(save.done.as_deref(), Some("✓ saved dev as snap-1"));
+    }
+
+    #[test]
+    fn snapshot_details_and_vm_pane_section() {
         let mut app = snap_view();
         let _ = app.key(press(KeyCode::Char('g'))); // fresh
         let _ = app.key(press(KeyCode::Down)); // deps
         let text = screen(&mut app, 130, 20);
-        assert!(text.contains("─ deps ─") && text.contains("memory and disk · 529 MB of memory"), "{text}");
-        assert!(text.contains("later  3 snapshots"), "{text}");
+        assert!(text.contains("─ deps ─") && text.contains("dev isn't here"), "{text}");
+        assert!(text.contains("memory and disk · 529 MB of memory") && text.contains("later  3 snapshots"), "{text}");
+        let _ = app.key(press(KeyCode::Char('G'))); // k8s, where it is
+        assert!(screen(&mut app, 130, 20).contains("dev is here · ● running"));
+
         let _ = app.key(press(KeyCode::Esc));
-        let text = screen(&mut app, 130, 20);
-        assert!(text.contains("snaps 5 · at k8s · t to browse"), "{text}");
+        let text = screen(&mut app, 130, 30);
+        assert!(text.contains("SNAPSHOTS") && text.contains("○ k8s") && text.contains("○ nix-2"), "{text}");
+        assert!(!text.contains("○ deps"), "only the newest three:\n{text}");
+        assert!(text.contains("S all (2 more) · ctrl-s save one"), "{text}");
     }
 
     #[test]

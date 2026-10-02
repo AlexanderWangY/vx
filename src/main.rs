@@ -111,7 +111,7 @@ struct SnapArgs {
 enum SnapCommand {
     /// Show a VM's snapshots as a tree
     Ls { vm: Option<String> },
-    /// Put a VM back how it was at a snapshot
+    /// Go back to a snapshot; the others are kept
     Restore {
         vm: String,
         snapshot: String,
@@ -472,35 +472,40 @@ fn snap_ls(vm: &Vm) -> Result<()> {
         println!("{} has no snapshots yet; take one with `vx snap {}`", vm.name, vm.name);
         return Ok(());
     }
-    let rows = history.rows(&|_| true);
-    let label = |row: &snapshot::Row| match row.at {
-        snapshot::At::Snapshot(i) => {
-            let e = &history.entries[i];
-            format!("{}{} {}", row.graph, snapshot::marker(e), e.snap.name)
-        }
-        snapshot::At::Now => format!("{}{} now", row.graph, snapshot::NOW),
-    };
-    let w = rows.iter().map(|r| label(r).chars().count()).max().unwrap_or(0);
-    let state = backend::get(&vm.spec.backend)?.state(vm);
+    let rows = history.rows();
+    let name_w = history.entries.iter().map(|e| e.snap.name.chars().count()).max().unwrap_or(0);
     for row in &rows {
-        let text = label(row);
-        let pad = " ".repeat(w - text.chars().count());
-        match row.at {
-            snapshot::At::Snapshot(i) => {
-                let e = &history.entries[i];
-                let memory = match e.snap.memory {
-                    0 => String::new(),
-                    n => format!("+{} memory", progress::bytes(n)),
-                };
-                let when = OUT.dim(format!("{:>8}", snapshot::ago(e.snap.created)));
-                let line = format!("{text}{pad}  {when}  {:16}  {}", OUT.dim(memory), e.note);
-                println!("{}", line.trim_end());
+        let Some(i) = row.node else {
+            let graph: String = row.cells.iter().map(|c| c.text(' ')).collect();
+            println!("{}", OUT.dim(graph.trim_end()));
+            continue;
+        };
+        let e = &history.entries[i];
+        let mut graph = String::new();
+        for cell in &row.cells {
+            match cell {
+                snapshot::Cell::Node => graph += &format!("{}", OUT.green(cell.text(snapshot::marker(e)))),
+                _ => graph += &format!("{}", OUT.dim(cell.text(' '))),
             }
-            snapshot::At::Now => println!("{}{pad}  {}", OUT.cyan(text), OUT.dim(state.to_string())),
         }
+        let name = format!("{:name_w$}", e.snap.name);
+        let name =
+            if history.current.as_deref() == Some(e.snap.name.as_str()) { OUT.accent(name).to_string() } else { name };
+        let memory = match e.snap.memory {
+            0 => "disk only".to_string(),
+            n => format!("{} memory", progress::bytes(n)),
+        };
+        let when = format!("{:>8}", snapshot::ago(e.snap.created));
+        let line = format!("{graph}{name}  {}  {}  {}", OUT.dim(when), OUT.dim(format!("{memory:>13}")), e.note);
+        println!("{}", line.trim_end());
     }
     println!();
-    println!("{}", OUT.dim("● memory and disk  ○ disk only  ◉ where the VM is now"));
+    let state = backend::get(&vm.spec.backend)?.state(vm);
+    let at = match &history.current {
+        Some(at) => format!("{} is at {} ({state})", vm.name, OUT.accent(at)),
+        None => format!("{} isn't at any of them ({state})", vm.name),
+    };
+    println!("{at}{}", OUT.dim(" · ● memory and disk · ○ disk only"));
     Ok(())
 }
 
@@ -510,9 +515,9 @@ fn snap_restore(vm: &Vm, name: &str, yes: bool) -> Result<()> {
     let entry = history.find(vm, name)?.clone();
     if !yes {
         let question = format!(
-            "restore {} to {}? what it has now is lost unless you snapshot it first",
+            "go back to {} in {}? what it has now is lost unless you snapshot it first; other snapshots are kept",
+            ERR.bold(name),
             ERR.bold(&vm.name),
-            ERR.bold(name)
         );
         let why = format!("not restoring {} without confirmation", vm.name);
         if !ask(&question, why, format!("vx snap restore -y {} {name}", vm.name))? {

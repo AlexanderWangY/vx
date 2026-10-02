@@ -140,65 +140,78 @@ impl History {
         (0..self.entries.len()).filter(|&i| self.entries[i].parent.as_deref() == parent).collect()
     }
 
-    /// The snapshots from the root down to where the VM is.
-    fn path(&self) -> HashSet<&str> {
-        let mut path = HashSet::new();
-        let mut at = self.current.as_deref();
-        while let Some(name) = at
-            && path.insert(name)
-        {
-            at = self.get(name).and_then(|e| e.parent.as_deref());
-        }
-        path
-    }
-
-    /// The tree as rows, top to bottom. The line from the first snapshot down to where the VM
-    /// is now runs straight down the left; everything else branches off it, so a long history
-    /// without branches never drifts right. Branches show their first snapshot, and the rest
-    /// only if `open` says so.
-    pub fn rows(&self, open: &dyn Fn(&str) -> bool) -> Vec<Row> {
-        let path = self.path();
+    /// The history as rows, oldest first, with a graph on the left like `git log --graph`.
+    /// A snapshot's first child carries on in its column and later ones fork into new columns,
+    /// so going back to an older snapshot never moves anything.
+    pub fn rows(&self) -> Vec<Row> {
+        // Each column: the snapshot it's waiting to draw next, or `None` when it's free.
+        let mut lanes: Vec<Option<usize>> = Vec::new();
+        let mut done = vec![false; self.entries.len()];
         let mut rows = Vec::new();
-        self.walk(None, "", &path, open, &mut rows);
+        for i in 0..self.entries.len() {
+            let lane = match lanes.iter().position(|l| *l == Some(i)) {
+                Some(lane) => lane,
+                // A first snapshot, or one whose parent is gone: a column of its own, so it can't
+                // pass for the next in a line that just ended.
+                None => free_lane(&mut lanes, usize::MAX),
+            };
+            let cells = lanes.iter().enumerate().map(|(k, l)| match (k == lane, l.is_some()) {
+                (true, _) => Cell::Node,
+                (false, true) => Cell::Line,
+                (false, false) => Cell::Empty,
+            });
+            rows.push(Row { cells: cells.collect(), node: Some(i) });
+            done[i] = true;
+
+            let kids: Vec<usize> =
+                self.children(Some(&self.entries[i].snap.name)).into_iter().filter(|&k| !done[k]).collect();
+            lanes[lane] = kids.first().copied();
+            if kids.len() < 2 {
+                continue;
+            }
+            // The rest fork off to the right, each into the first free column.
+            let before: Vec<bool> = lanes.iter().map(Option::is_some).collect();
+            let forks: Vec<usize> = kids[1..]
+                .iter()
+                .map(|&kid| {
+                    let k = free_lane(&mut lanes, lane + 1);
+                    lanes[k] = Some(kid);
+                    k
+                })
+                .collect();
+            let last = *forks.last().unwrap();
+            let cells = (0..lanes.len()).map(|k| {
+                if k == lane {
+                    Cell::Fork
+                } else if k == last {
+                    Cell::ForkEnd
+                } else if forks.contains(&k) {
+                    Cell::ForkMid
+                } else if k > lane && k < last {
+                    if before.get(k) == Some(&true) { Cell::Cross } else { Cell::Across }
+                } else if before.get(k) == Some(&true) {
+                    Cell::Line
+                } else {
+                    Cell::Empty
+                }
+            });
+            rows.push(Row { cells: cells.collect(), node: None });
+        }
+        let width = lanes.len().max(rows.iter().map(|r| r.cells.len()).max().unwrap_or(0));
+        for row in &mut rows {
+            row.cells.resize(width, Cell::Empty);
+        }
         rows
     }
+}
 
-    fn walk(
-        &self,
-        parent: Option<&str>,
-        prefix: &str,
-        path: &HashSet<&str>,
-        open: &dyn Fn(&str) -> bool,
-        rows: &mut Vec<Row>,
-    ) {
-        let kids = self.children(parent);
-        let on_path = parent.is_none_or(|p| path.contains(p));
-        // What carries on straight down: towards where the VM is, or in a branch, its newest snapshot.
-        let main = if on_path {
-            kids.iter().copied().find(|&i| path.contains(self.entries[i].snap.name.as_str()))
-        } else {
-            kids.last().copied()
-        };
-        for &i in kids.iter().filter(|&&i| Some(i) != main) {
-            let name = &self.entries[i].snap.name;
-            let hidden = self.descendants(name);
-            let is_open = hidden > 0 && open(name);
-            let fold = (hidden > 0).then_some(Fold { open: is_open, hidden });
-            rows.push(Row { graph: format!("{prefix}├─"), at: At::Snapshot(i), fold });
-            if is_open {
-                self.walk(Some(name), &format!("{prefix}│ "), path, open, rows);
-            }
-        }
-        match main {
-            Some(i) => {
-                rows.push(Row { graph: prefix.to_string(), at: At::Snapshot(i), fold: None });
-                self.walk(Some(&self.entries[i].snap.name), prefix, path, open, rows);
-            }
-            // The end of the line to where the VM is.
-            None if on_path && parent == self.current.as_deref() => {
-                rows.push(Row { graph: prefix.to_string(), at: At::Now, fold: None });
-            }
-            None => {}
+/// The first free column at or after `from`, adding one if none is.
+fn free_lane(lanes: &mut Vec<Option<usize>>, from: usize) -> usize {
+    match (from.min(lanes.len())..lanes.len()).find(|&k| lanes[k].is_none()) {
+        Some(k) => k,
+        None => {
+            lanes.push(None);
+            lanes.len() - 1
         }
     }
 }
@@ -222,37 +235,55 @@ fn nearest<'a>(
     None
 }
 
-/// One line of the tree.
+/// One line of the history: a snapshot, or the fork after one that has several children.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
-    /// The lines drawn before it, e.g. `│ ├─`.
-    pub graph: String,
-    pub at: At,
-    /// For the first snapshot of a branch that has more.
-    pub fold: Option<Fold>,
+    /// One per column of the graph.
+    pub cells: Vec<Cell>,
+    /// An index into `History::entries`; `None` for a fork.
+    pub node: Option<usize>,
 }
 
+/// Two characters of graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum At {
-    /// An index into `History::entries`.
-    Snapshot(usize),
-    /// Where the VM is now.
-    Now,
+pub enum Cell {
+    Empty,
+    /// The snapshot on this row; drawn by the caller, with `marker`.
+    Node,
+    /// A column passing by.
+    Line,
+    /// Where a fork leaves its parent's column.
+    Fork,
+    /// A forked column starting, the last one.
+    ForkEnd,
+    /// A forked column starting, with more to its right.
+    ForkMid,
+    /// The fork's line passing an empty column…
+    Across,
+    /// …or crossing a busy one.
+    Cross,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Fold {
-    pub open: bool,
-    /// Snapshots in the branch after its first.
-    pub hidden: usize,
+impl Cell {
+    /// The cell as text, with `node` for `Cell::Node`.
+    pub fn text(self, node: char) -> String {
+        match self {
+            Cell::Empty => "  ".into(),
+            Cell::Node => format!("{node} "),
+            Cell::Line => "│ ".into(),
+            Cell::Fork => "├─".into(),
+            Cell::ForkEnd => "╮ ".into(),
+            Cell::ForkMid => "┬─".into(),
+            Cell::Across => "──".into(),
+            Cell::Cross => "┼─".into(),
+        }
+    }
 }
 
 /// A snapshot's marker: filled when its memory was saved too.
 pub fn marker(entry: &Entry) -> char {
     if entry.snap.memory > 0 { '●' } else { '○' }
 }
-
-pub const NOW: char = '◉';
 
 pub fn validate_name(name: &str) -> Result<()> {
     // Starting with a letter also keeps it from being read as one of QEMU's numeric snapshot IDs.
@@ -300,49 +331,70 @@ mod tests {
         h
     }
 
-    /// The rows as text, the way `vx snap ls` draws them.
-    fn draw(h: &History, open: &dyn Fn(&str) -> bool) -> Vec<String> {
-        h.rows(open)
+    /// The rows as text, the way `vx snap ls` draws them, with `*` after where the VM is.
+    fn draw(h: &History) -> Vec<String> {
+        h.rows()
             .iter()
             .map(|row| {
-                let fold = match row.fold {
-                    Some(Fold { open: true, .. }) => "▾",
-                    Some(Fold { open: false, .. }) => "▸",
-                    None => "",
-                };
-                match row.at {
-                    At::Snapshot(i) => format!("{}{fold}○ {}", row.graph, h.entries[i].snap.name),
-                    At::Now => format!("{}◉ now", row.graph),
+                let graph: String = row.cells.iter().map(|c| c.text('○')).collect();
+                match row.node {
+                    Some(i) => {
+                        let name = &h.entries[i].snap.name;
+                        let here = if h.current.as_deref() == Some(name.as_str()) { "*" } else { "" };
+                        format!("{graph}{name}{here}")
+                    }
+                    None => graph.trim_end().to_string(),
                 }
             })
             .collect()
     }
 
     #[test]
-    fn branches_hang_off_the_line_to_now() {
+    fn forks_open_a_column() {
         let h = history();
-        assert_eq!(draw(&h, &|_| false), ["○ fresh", "○ deps", "├─▸○ try-nix", "○ k8s", "◉ now"]);
-        assert_eq!(draw(&h, &|_| true), ["○ fresh", "○ deps", "├─▾○ try-nix", "│ ○ nix-2", "○ k8s", "◉ now"]);
+        assert_eq!(draw(&h), ["○   fresh", "○   deps", "├─╮", "○ │ try-nix", "○ │ nix-2", "  ○ k8s*"]);
         assert_eq!(h.descendants("deps"), 3);
     }
 
     #[test]
-    fn restoring_moves_the_line() {
+    fn going_back_moves_nothing() {
         let mut h = history();
+        let before = h.rows();
         h.current = Some("nix-2".into());
-        assert_eq!(draw(&h, &|_| false), ["○ fresh", "○ deps", "├─○ k8s", "○ try-nix", "○ nix-2", "◉ now"]);
+        assert_eq!(h.rows(), before);
     }
 
     #[test]
-    fn nested_branches() {
+    fn nested_and_crossing_forks() {
         let mut h = history();
         h.current = Some("try-nix".into());
-        h.add(snap("nix-3", 6), String::new()); // a sibling of nix-2
-        h.current = Some("k8s".into());
+        h.add(snap("nix-3", 6), String::new()); // a sibling of nix-2, after k8s
+        h.current = Some("fresh".into());
+        h.add(snap("alt", 7), String::new()); // a second child of fresh
         assert_eq!(
-            draw(&h, &|_| true),
-            ["○ fresh", "○ deps", "├─▾○ try-nix", "│ ├─○ nix-2", "│ ○ nix-3", "○ k8s", "◉ now"]
+            draw(&h),
+            [
+                "○       fresh",
+                "├─╮",
+                "○ │     deps",
+                "├─┼─╮",
+                "○ │ │   try-nix",
+                "├─┼─┼─╮",
+                "○ │ │ │ nix-2",
+                "  │ ○ │ k8s",
+                "  │   ○ nix-3",
+                "  ○     alt*",
+            ]
         );
+    }
+
+    #[test]
+    fn linear_history_is_one_column() {
+        let mut h = History::default();
+        for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
+            h.add(snap(name, i as u64), String::new());
+        }
+        assert_eq!(draw(&h), ["○ a", "○ b", "○ c*"]);
     }
 
     #[test]
@@ -353,7 +405,7 @@ mod tests {
         assert_eq!(h.get("k8s").unwrap().parent.as_deref(), Some("fresh"));
         h.remove("k8s");
         assert_eq!(h.current.as_deref(), Some("fresh"));
-        assert_eq!(draw(&h, &|_| true), ["○ fresh", "├─▾○ try-nix", "│ ○ nix-2", "◉ now"]);
+        assert_eq!(draw(&h), ["○ fresh*", "○ try-nix", "○ nix-2"]);
     }
 
     #[test]
@@ -379,13 +431,13 @@ mod tests {
         assert_eq!(h.get("a").unwrap().note, "kept");
         assert_eq!(h.get("b").unwrap().parent.as_deref(), Some("a"));
         assert_eq!(h.get("c").unwrap().parent, None);
-        assert_eq!(draw(&h, &|_| true), ["├─○ c", "○ a", "├─○ b", "◉ now"]);
+        assert_eq!(draw(&h), ["○   a*", "○   b", "  ○ c"]);
     }
 
     #[test]
     fn nothing_yet() {
         let h = History::default();
-        assert_eq!(draw(&h, &|_| true), ["◉ now"]);
+        assert!(draw(&h).is_empty());
         assert_eq!(h.next_name(), "snap-1");
         assert_eq!(history().next_name(), "snap-1");
     }
