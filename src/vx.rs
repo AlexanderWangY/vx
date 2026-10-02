@@ -454,7 +454,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_specs() {
-        let good = spec().to_toml().unwrap();
+        // The default CPU count depends on the host, so pin it for the replacements below.
+        let good = Spec { cpus: 4, ..spec() }.to_toml().unwrap();
         let bad = [
             good.replace("cpus = 4", "cpu = 4"),
             good.replace("cpus = 4", "cpus = 0"),
