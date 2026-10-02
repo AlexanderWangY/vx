@@ -40,7 +40,7 @@ use crate::form::{AddImageForm, NewForm, NewImage, NewSnap, SnapForm, Step};
 use crate::host::Arch;
 use crate::image::{self, Info};
 use crate::progress::bytes;
-use crate::snapshot::{self, Cell as GraphCell, History};
+use crate::snapshot::{self, History};
 use crate::stats::{Sample, Stats, Watcher};
 use crate::style::{self, ERR, OUT};
 use crate::vx::{Home, Spec};
@@ -318,7 +318,7 @@ enum View {
     #[default]
     Vms,
     Images,
-    /// The snapshot tree of `App::snap_vm`.
+    /// The snapshots of `App::snap_vm`.
     Snapshots,
 }
 
@@ -337,8 +337,8 @@ enum Modal {
     Snap(Box<SnapForm>),
     /// Asking before restoring the snapshot view's VM to this snapshot.
     Restore(String),
-    /// Asking before deleting this snapshot, which has this many after it.
-    DeleteSnapshot(String, usize),
+    /// Asking before deleting this snapshot.
+    DeleteSnapshot(String),
 }
 
 /// A VM being created, shown as a row before its directory exists.
@@ -554,11 +554,6 @@ impl App {
         self.history_of(&self.snap_vm)
     }
 
-    /// The snapshot view's rows, as drawn.
-    fn snap_rows(&self) -> Vec<snapshot::Row> {
-        self.snap_history().map(History::rows).unwrap_or_default()
-    }
-
     /// The selected snapshot: the one picked, else the one the VM is at, else the newest.
     fn snap_pick(&self) -> Option<&snapshot::Entry> {
         let h = self.snap_history()?;
@@ -566,10 +561,10 @@ impl App {
         picked.or_else(|| h.current.as_deref().and_then(|name| h.get(name))).or_else(|| h.entries.last())
     }
 
-    /// The index of the selected snapshot's row in `rows`.
-    fn snap_index(&self, rows: &[snapshot::Row]) -> Option<usize> {
+    /// The selected snapshot's place in the list.
+    fn snap_index(&self) -> Option<usize> {
         let (h, pick) = (self.snap_history()?, self.snap_pick()?);
-        rows.iter().position(|row| row.node.is_some_and(|i| h.entries[i].snap.name == pick.snap.name))
+        h.entries.iter().position(|e| e.snap.name == pick.snap.name)
     }
 
     fn open_snapshots(&mut self, name: String) {
@@ -769,7 +764,7 @@ impl App {
                     _ => self.modal = Some(Modal::Restore(name)),
                 }
             }
-            Modal::DeleteSnapshot(name, after) => match confirm(key) {
+            Modal::DeleteSnapshot(name) => match confirm(key) {
                 Some(true) => {
                     let vm = self.snap_vm.clone();
                     let args = vec!["snap".into(), "rm".into(), "-y".into(), vm.clone(), name.clone()];
@@ -777,7 +772,7 @@ impl App {
                     return self.snap_job(vm, Verb::DeleteSnapshot, args, None, done);
                 }
                 Some(false) => {}
-                None => self.modal = Some(Modal::DeleteSnapshot(name, after)),
+                None => self.modal = Some(Modal::DeleteSnapshot(name)),
             },
         }
         Action::None
@@ -878,25 +873,22 @@ impl App {
 
     fn snap_key(&mut self, key: KeyEvent) -> Action {
         let vm = self.snap_vm.clone();
-        let rows = self.snap_rows();
+        let at = self.snap_index();
         let Some(history) = self.snap_history() else { return Action::None };
-        // Only snapshots can be selected, not the forks between them.
-        let nodes: Vec<usize> = rows.iter().filter_map(|r| r.node).collect();
-        let at = self.snap_pick().and_then(|p| nodes.iter().position(|&i| history.entries[i].snap.name == p.snap.name));
+        let len = history.entries.len();
         let moved = match key.code {
-            _ if nodes.is_empty() => None,
+            _ if len == 0 => None,
             KeyCode::Up | KeyCode::Char('k') => at.map(|i| i.saturating_sub(1)),
-            KeyCode::Down | KeyCode::Char('j') => at.map(|i| (i + 1).min(nodes.len() - 1)),
+            KeyCode::Down | KeyCode::Char('j') => at.map(|i| (i + 1).min(len - 1)),
             KeyCode::Home | KeyCode::Char('g') => Some(0),
-            KeyCode::End | KeyCode::Char('G') => Some(nodes.len() - 1),
+            KeyCode::End | KeyCode::Char('G') => Some(len - 1),
             _ => None,
         };
         if let Some(i) = moved {
-            self.snap_selected = Some(history.entries[nodes[i]].snap.name.clone());
+            self.snap_selected = Some(history.entries[i].snap.name.clone());
             return Action::None;
         }
         let pick = self.snap_pick().map(|p| p.snap.name.clone());
-        let after = pick.as_deref().map_or(0, |n| history.descendants(n));
         let taken: Vec<String> = history.entries.iter().map(|e| e.snap.name.clone()).collect();
         let suggested = history.next_name();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -910,7 +902,7 @@ impl App {
             (KeyCode::Char('s'), _) if ctrl => return self.quick_snap(vm),
             (KeyCode::Char('c'), _) => self.modal = Some(Modal::Snap(Box::new(SnapForm::new(&vm, &suggested, taken)))),
             (KeyCode::Enter, Some(name)) => self.modal = Some(Modal::Restore(name)),
-            (KeyCode::Char('d'), Some(name)) => self.modal = Some(Modal::DeleteSnapshot(name, after)),
+            (KeyCode::Char('d'), Some(name)) => self.modal = Some(Modal::DeleteSnapshot(name)),
             _ => {}
         }
         Action::None
@@ -1033,11 +1025,10 @@ impl App {
                     0
                 }
                 _ => {
-                    let rows = self.snap_rows();
-                    self.snap_table.select(self.snap_index(&rows));
-                    let table = self.snap_table(&rows, spinner);
+                    self.snap_table.select(self.snap_index());
+                    let table = self.snap_table(spinner);
                     frame.render_stateful_widget(table, body, &mut self.snap_table);
-                    rows.len()
+                    self.snap_history().map_or(0, |h| h.entries.len())
                 }
             },
         };
@@ -1108,13 +1099,9 @@ impl App {
                 let keys = [("y", "go back"), ("s", "save first, then go back"), ("n", "cancel")];
                 draw_ask(frame, area, "go back", WARN, what, note, &keys);
             }
-            Some(Modal::DeleteSnapshot(name, after)) => {
+            Some(Modal::DeleteSnapshot(name)) => {
                 let what = vec![Span::raw("Delete snapshot "), Span::styled(name.clone(), HEADER), Span::raw("?")];
-                let note = match after {
-                    0 => "The VM itself isn't touched.".to_string(),
-                    n => format!("The {n} taken after it stay, and move up a step."),
-                };
-                draw_confirm(frame, area, what, &note);
+                draw_confirm(frame, area, what, "The VM and its other snapshots aren't touched.");
             }
             None => {}
         }
@@ -1405,64 +1392,60 @@ impl App {
         frame.render_widget(Paragraph::new(lines(cpu_rows, net_rows)), inner);
     }
 
-    /// The snapshot history, one row per line of `rows`. The snapshot the VM is at is
+    /// The snapshots as a list, oldest first, like save slots. The one the VM came from is
     /// highlighted.
-    fn snap_table(&self, rows: &[snapshot::Row], spinner: char) -> Table<'static> {
+    fn snap_table(&self, spinner: char) -> Table<'static> {
         let Some(h) = self.snap_history() else { return Table::default() };
         let selected = self.snap_table.selected();
         let right = |s: String| Cell::from(Line::from(s).alignment(Alignment::Right));
         let busy = self.vm_busy_label(&self.snap_vm);
-        let mut label_width = 8;
-        let table_rows: Vec<Row> = rows
+        let rows: Vec<Row> = h
+            .entries
             .iter()
             .enumerate()
-            .map(|(r, row)| {
-                let text = if selected == Some(r) { SELECTED_TEXT } else { Style::new() };
-                let Some(i) = row.node else {
-                    let graph: String = row.cells.iter().map(|c| c.text(' ')).collect();
-                    return Row::new(vec![Cell::from(Span::styled(graph, BORDER))]);
-                };
-                let entry = &h.entries[i];
+            .map(|(i, entry)| {
+                let text = if selected == Some(i) { SELECTED_TEXT } else { Style::new() };
                 let here = h.current.as_deref() == Some(entry.snap.name.as_str());
-                let mut label = Vec::new();
-                for cell in &row.cells {
-                    label.push(match cell {
-                        GraphCell::Node => {
-                            let style = if here {
-                                ACCENT
-                            } else if entry.snap.memory > 0 {
-                                OK
-                            } else {
-                                DIM
-                            };
-                            Span::styled(cell.text(snapshot::marker(entry)), style)
-                        }
-                        _ => Span::styled(cell.text(' '), BORDER),
-                    });
-                }
-                label.push(Span::styled(clip(&entry.snap.name, 24), if here { ACCENT } else { Style::new() }));
-                let label = Line::from(label);
-                label_width = label_width.max(label.width());
+                let marker = Span::styled(
+                    format!("{} ", snapshot::marker(entry)),
+                    if here {
+                        ACCENT
+                    } else if entry.snap.memory > 0 {
+                        OK
+                    } else {
+                        DIM
+                    },
+                );
+                let name = Span::styled(clip(&entry.snap.name, 24), if here { ACCENT } else { Style::new() });
                 let memory = match entry.snap.memory {
                     0 => Span::styled("disk", DIM),
                     n => Span::raw(bytes(n)),
                 };
-                // While a job runs, it shows on the row the VM is at.
-                let note = match &busy {
-                    Some(busy) if here => Span::styled(format!("{spinner} {busy}"), BUSY),
-                    _ => Span::styled(entry.note.clone(), DIM),
-                };
+                // Where it was saved from, when that isn't the row above; and while a job runs,
+                // what it's doing, on the row the VM came from.
+                let mut note = Vec::new();
+                match &busy {
+                    Some(busy) if here => note.push(Span::styled(format!("{spinner} {busy}"), BUSY)),
+                    _ => {
+                        if let Some(from) = h.from(i) {
+                            let sep = if entry.note.is_empty() { "" } else { " · " };
+                            note.push(Span::styled(format!("from {from}{sep}"), DIM));
+                        }
+                        note.push(Span::styled(entry.note.clone(), DIM));
+                    }
+                }
                 Row::new(vec![
-                    Cell::from(label),
+                    Cell::from(Line::from(vec![marker, name])),
                     right(snapshot::ago(entry.snap.created)),
                     Cell::from(Line::from(memory).alignment(Alignment::Right)),
-                    Cell::from(note),
+                    Cell::from(Line::from(note)),
                 ])
                 .style(text)
             })
             .collect();
+        let name_width = h.entries.iter().map(|e| e.snap.name.chars().count().min(24)).max().unwrap_or(0) + 2;
         let widths = [
-            Constraint::Length(label_width.min(48) as u16),
+            Constraint::Length(name_width.max(8) as u16),
             Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Fill(1),
@@ -1470,7 +1453,7 @@ impl App {
         let header =
             Row::new(vec![Cell::from("SNAPSHOT"), right("SAVED".into()), right("MEMORY".into()), Cell::from("NOTE")])
                 .style(HEADER);
-        Table::new(table_rows, widths).header(header).column_spacing(2).row_highlight_style(SELECTED)
+        Table::new(rows, widths).header(header).column_spacing(2).row_highlight_style(SELECTED)
     }
 
     fn vm_state(&self, name: &str) -> Option<&State> {
@@ -1520,10 +1503,6 @@ impl App {
         lines.push(field("saved", kind));
         lines.push(field("", format!("{} · {}", snapshot::ago(e.snap.created), local_time(e.snap.created))));
         lines.push(field("from", e.parent.clone().unwrap_or_else(|| "the start".into())));
-        let later = h.descendants(&e.snap.name);
-        if later > 0 {
-            lines.push(field("later", format!("{later} snapshot{}", if later == 1 { "" } else { "s" })));
-        }
         if !e.note.is_empty() {
             lines.push(Line::default());
             lines.push(Line::raw(e.note.clone()));
@@ -2512,33 +2491,27 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_history_is_a_stable_graph() {
+    fn snapshots_are_a_list_of_save_slots() {
         let mut app = snap_view();
         let text = screen(&mut app, 100, 12);
         assert!(text.contains("vx ─ VMs › dev › snapshots"), "{text}");
         assert!(text.contains("5 snapshots · at k8s"), "{text}");
-        for want in ["│ ○   fresh ", "│ ●   deps ", "│ ├─╮ ", "│ ○ │ try-nix ", "│ ○ │ nix-2 ", "│   ○ k8s "]
-        {
+        let rows: Vec<String> =
+            text.lines().skip(2).take(5).map(|l| l.split_whitespace().take(2).collect::<Vec<_>>().join(" ")).collect();
+        assert_eq!(rows, ["│ ○", "│ ●", "│ ○", "│ ○", "│ ○"], "one marker per row, no graph:\n{text}");
+        for want in ["○ fresh ", "● deps ", "○ try-nix ", "○ nix-2 ", "○ k8s "] {
             assert!(text.contains(want), "missing {want:?}:\n{text}");
         }
-        assert!(!text.contains("now"), "no row of its own for where the VM is:\n{text}");
+        // Only k8s says where it came from: it isn't the row above.
+        assert!(text.contains("from deps · kind up"), "{text}");
+        assert_eq!(text.matches("from ").count(), 1, "{text}");
 
-        // The VM is at k8s, so that's selected to start with; up skips the fork row.
+        // The VM came from k8s, so that's selected to start with.
         assert_eq!(app.snap_pick().unwrap().snap.name, "k8s");
         let _ = app.key(press(KeyCode::Up));
         assert_eq!(app.snap_pick().unwrap().snap.name, "nix-2");
-        for _ in 0..3 {
-            let _ = app.key(press(KeyCode::Up));
-        }
+        let _ = app.key(press(KeyCode::Char('g')));
         assert_eq!(app.snap_pick().unwrap().snap.name, "fresh");
-
-        // Going back somewhere else changes the highlight, not the layout.
-        let body = |app: &mut App| screen(app, 100, 12).lines().skip(1).collect::<Vec<_>>().join("\n");
-        let before = body(&mut app);
-        let mut moved = snap_history();
-        moved.current = Some("nix-2".into());
-        app.update_history(Some(("dev".into(), Ok(moved))));
-        assert_eq!(body(&mut app), before);
 
         // Esc goes back to the VMs rather than quitting.
         assert_eq!(app.key(press(KeyCode::Esc)), Action::None);
@@ -2564,7 +2537,7 @@ mod tests {
         let mut app = snap_view();
         let _ = app.key(press(KeyCode::Char('g'))); // fresh
         let _ = app.key(press(KeyCode::Char('d')));
-        assert!(screen(&mut app, 100, 16).contains("The 4 taken after it stay"));
+        assert!(screen(&mut app, 100, 16).contains("its other snapshots aren't touched"));
         assert_eq!(job(&mut app, KeyCode::Char('y')).unwrap().args, ["snap", "rm", "-y", "dev", "fresh"]);
 
         let mut app = snap_view();
@@ -2598,7 +2571,7 @@ mod tests {
         let _ = app.key(press(KeyCode::Down)); // deps
         let text = screen(&mut app, 130, 20);
         assert!(text.contains("─ deps ─") && text.contains("dev isn't here"), "{text}");
-        assert!(text.contains("memory and disk · 529 MB of memory") && text.contains("later  3 snapshots"), "{text}");
+        assert!(text.contains("memory and disk · 529 MB of memory") && text.contains("from   fresh"), "{text}");
         let _ = app.key(press(KeyCode::Char('G'))); // k8s, where it is
         assert!(screen(&mut app, 130, 20).contains("dev is here · ● running"));
 

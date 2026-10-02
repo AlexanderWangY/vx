@@ -1,7 +1,7 @@
-//! Snapshot history. The backend keeps the snapshots themselves (QEMU: inside disk.qcow2) as a
-//! flat list; vx adds how they relate in the VM's snapshots.toml: each one's parent, a note,
-//! and which one the VM was last saved or restored at. Restoring an older snapshot and saving
-//! again starts a branch, so the history is a tree.
+//! Snapshots as save slots: each is the whole VM at one moment, independent of the others, so
+//! going back to one or deleting one never changes another. The backend keeps them (QEMU:
+//! inside disk.qcow2); vx adds what it doesn't record in the VM's snapshots.toml: a note, which
+//! snapshot each was saved from, and which one the VM came from last.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -25,7 +25,7 @@ pub struct Entry {
     pub note: String,
 }
 
-/// A VM's snapshots, oldest first, and where the VM is in their tree.
+/// A VM's snapshots, oldest first, and which one the VM came from.
 #[derive(Debug, Default)]
 pub struct History {
     pub entries: Vec<Entry>,
@@ -115,8 +115,8 @@ impl History {
         self.entries.push(Entry { snap, parent, note });
     }
 
-    /// Forget a deleted snapshot. Its children move up to its parent, and so does the VM if
-    /// it was there.
+    /// Forget a deleted snapshot. What was saved from it now counts as saved from where it
+    /// was saved from, and the same goes for the VM.
     pub fn remove(&mut self, name: &str) {
         let Some(i) = self.entries.iter().position(|e| e.snap.name == name) else { return };
         let gone = self.entries.remove(i);
@@ -130,89 +130,12 @@ impl History {
         }
     }
 
-    /// How many snapshots descend from `name`.
-    pub fn descendants(&self, name: &str) -> usize {
-        self.children(Some(name)).iter().map(|&i| 1 + self.descendants(&self.entries[i].snap.name)).sum()
-    }
-
-    /// Indexes of the snapshots whose parent is `parent`, oldest first.
-    fn children(&self, parent: Option<&str>) -> Vec<usize> {
-        (0..self.entries.len()).filter(|&i| self.entries[i].parent.as_deref() == parent).collect()
-    }
-
-    /// The history as rows, oldest first, with a graph on the left like `git log --graph`.
-    /// A snapshot's first child carries on in its column and later ones fork into new columns,
-    /// so going back to an older snapshot never moves anything.
-    pub fn rows(&self) -> Vec<Row> {
-        // Each column: the snapshot it's waiting to draw next, or `None` when it's free.
-        let mut lanes: Vec<Option<usize>> = Vec::new();
-        let mut done = vec![false; self.entries.len()];
-        let mut rows = Vec::new();
-        for i in 0..self.entries.len() {
-            let lane = match lanes.iter().position(|l| *l == Some(i)) {
-                Some(lane) => lane,
-                // A first snapshot, or one whose parent is gone: a column of its own, so it can't
-                // pass for the next in a line that just ended.
-                None => free_lane(&mut lanes, usize::MAX),
-            };
-            let cells = lanes.iter().enumerate().map(|(k, l)| match (k == lane, l.is_some()) {
-                (true, _) => Cell::Node,
-                (false, true) => Cell::Line,
-                (false, false) => Cell::Empty,
-            });
-            rows.push(Row { cells: cells.collect(), node: Some(i) });
-            done[i] = true;
-
-            let kids: Vec<usize> =
-                self.children(Some(&self.entries[i].snap.name)).into_iter().filter(|&k| !done[k]).collect();
-            lanes[lane] = kids.first().copied();
-            if kids.len() < 2 {
-                continue;
-            }
-            // The rest fork off to the right, each into the first free column.
-            let before: Vec<bool> = lanes.iter().map(Option::is_some).collect();
-            let forks: Vec<usize> = kids[1..]
-                .iter()
-                .map(|&kid| {
-                    let k = free_lane(&mut lanes, lane + 1);
-                    lanes[k] = Some(kid);
-                    k
-                })
-                .collect();
-            let last = *forks.last().unwrap();
-            let cells = (0..lanes.len()).map(|k| {
-                if k == lane {
-                    Cell::Fork
-                } else if k == last {
-                    Cell::ForkEnd
-                } else if forks.contains(&k) {
-                    Cell::ForkMid
-                } else if k > lane && k < last {
-                    if before.get(k) == Some(&true) { Cell::Cross } else { Cell::Across }
-                } else if before.get(k) == Some(&true) {
-                    Cell::Line
-                } else {
-                    Cell::Empty
-                }
-            });
-            rows.push(Row { cells: cells.collect(), node: None });
-        }
-        let width = lanes.len().max(rows.iter().map(|r| r.cells.len()).max().unwrap_or(0));
-        for row in &mut rows {
-            row.cells.resize(width, Cell::Empty);
-        }
-        rows
-    }
-}
-
-/// The first free column at or after `from`, adding one if none is.
-fn free_lane(lanes: &mut Vec<Option<usize>>, from: usize) -> usize {
-    match (from.min(lanes.len())..lanes.len()).find(|&k| lanes[k].is_none()) {
-        Some(k) => k,
-        None => {
-            lanes.push(None);
-            lanes.len() - 1
-        }
+    /// Where snapshot `i` was saved from, when that isn't the snapshot listed just before it:
+    /// after going back to an older one. A straight run of snapshots never needs saying.
+    pub fn from(&self, i: usize) -> Option<&str> {
+        let parent = self.entries[i].parent.as_deref()?;
+        let previous = i.checked_sub(1).map(|p| self.entries[p].snap.name.as_str());
+        (previous != Some(parent)).then_some(parent)
     }
 }
 
@@ -233,51 +156,6 @@ fn nearest<'a>(
         name = records.get(n).and_then(|r| r.parent.as_deref());
     }
     None
-}
-
-/// One line of the history: a snapshot, or the fork after one that has several children.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Row {
-    /// One per column of the graph.
-    pub cells: Vec<Cell>,
-    /// An index into `History::entries`; `None` for a fork.
-    pub node: Option<usize>,
-}
-
-/// Two characters of graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cell {
-    Empty,
-    /// The snapshot on this row; drawn by the caller, with `marker`.
-    Node,
-    /// A column passing by.
-    Line,
-    /// Where a fork leaves its parent's column.
-    Fork,
-    /// A forked column starting, the last one.
-    ForkEnd,
-    /// A forked column starting, with more to its right.
-    ForkMid,
-    /// The fork's line passing an empty column…
-    Across,
-    /// …or crossing a busy one.
-    Cross,
-}
-
-impl Cell {
-    /// The cell as text, with `node` for `Cell::Node`.
-    pub fn text(self, node: char) -> String {
-        match self {
-            Cell::Empty => "  ".into(),
-            Cell::Node => format!("{node} "),
-            Cell::Line => "│ ".into(),
-            Cell::Fork => "├─".into(),
-            Cell::ForkEnd => "╮ ".into(),
-            Cell::ForkMid => "┬─".into(),
-            Cell::Across => "──".into(),
-            Cell::Cross => "┼─".into(),
-        }
-    }
 }
 
 /// A snapshot's marker: filled when its memory was saved too.
@@ -331,70 +209,29 @@ mod tests {
         h
     }
 
-    /// The rows as text, the way `vx snap ls` draws them, with `*` after where the VM is.
-    fn draw(h: &History) -> Vec<String> {
-        h.rows()
-            .iter()
-            .map(|row| {
-                let graph: String = row.cells.iter().map(|c| c.text('○')).collect();
-                match row.node {
-                    Some(i) => {
-                        let name = &h.entries[i].snap.name;
-                        let here = if h.current.as_deref() == Some(name.as_str()) { "*" } else { "" };
-                        format!("{graph}{name}{here}")
-                    }
-                    None => graph.trim_end().to_string(),
+    /// Each snapshot with its `from` note, and `*` after the one the VM came from.
+    fn list(h: &History) -> Vec<String> {
+        (0..h.entries.len())
+            .map(|i| {
+                let name = &h.entries[i].snap.name;
+                let here = if h.current.as_deref() == Some(name.as_str()) { "*" } else { "" };
+                match h.from(i) {
+                    Some(from) => format!("{name}{here} (from {from})"),
+                    None => format!("{name}{here}"),
                 }
             })
             .collect()
     }
 
     #[test]
-    fn forks_open_a_column() {
+    fn from_only_shows_after_going_back() {
         let h = history();
-        assert_eq!(draw(&h), ["○   fresh", "○   deps", "├─╮", "○ │ try-nix", "○ │ nix-2", "  ○ k8s*"]);
-        assert_eq!(h.descendants("deps"), 3);
-    }
-
-    #[test]
-    fn going_back_moves_nothing() {
-        let mut h = history();
-        let before = h.rows();
-        h.current = Some("nix-2".into());
-        assert_eq!(h.rows(), before);
-    }
-
-    #[test]
-    fn nested_and_crossing_forks() {
-        let mut h = history();
-        h.current = Some("try-nix".into());
-        h.add(snap("nix-3", 6), String::new()); // a sibling of nix-2, after k8s
-        h.current = Some("fresh".into());
-        h.add(snap("alt", 7), String::new()); // a second child of fresh
-        assert_eq!(
-            draw(&h),
-            [
-                "○       fresh",
-                "├─╮",
-                "○ │     deps",
-                "├─┼─╮",
-                "○ │ │   try-nix",
-                "├─┼─┼─╮",
-                "○ │ │ │ nix-2",
-                "  │ ○ │ k8s",
-                "  │   ○ nix-3",
-                "  ○     alt*",
-            ]
-        );
-    }
-
-    #[test]
-    fn linear_history_is_one_column() {
-        let mut h = History::default();
+        assert_eq!(list(&h), ["fresh", "deps", "try-nix", "nix-2", "k8s* (from deps)"]);
+        let mut straight = History::default();
         for (i, name) in ["a", "b", "c"].into_iter().enumerate() {
-            h.add(snap(name, i as u64), String::new());
+            straight.add(snap(name, i as u64), String::new());
         }
-        assert_eq!(draw(&h), ["○ a", "○ b", "○ c*"]);
+        assert_eq!(list(&straight), ["a", "b", "c*"]);
     }
 
     #[test]
@@ -403,9 +240,10 @@ mod tests {
         h.remove("deps");
         assert_eq!(h.get("try-nix").unwrap().parent.as_deref(), Some("fresh"));
         assert_eq!(h.get("k8s").unwrap().parent.as_deref(), Some("fresh"));
+        assert_eq!(list(&h), ["fresh", "try-nix", "nix-2", "k8s* (from fresh)"]);
         h.remove("k8s");
         assert_eq!(h.current.as_deref(), Some("fresh"));
-        assert_eq!(draw(&h), ["○ fresh*", "○ try-nix", "○ nix-2"]);
+        assert_eq!(list(&h), ["fresh*", "try-nix", "nix-2"]);
     }
 
     #[test]
@@ -431,13 +269,13 @@ mod tests {
         assert_eq!(h.get("a").unwrap().note, "kept");
         assert_eq!(h.get("b").unwrap().parent.as_deref(), Some("a"));
         assert_eq!(h.get("c").unwrap().parent, None);
-        assert_eq!(draw(&h), ["○   a*", "○   b", "  ○ c"]);
+        assert_eq!(list(&h), ["a*", "b", "c"]);
     }
 
     #[test]
     fn nothing_yet() {
         let h = History::default();
-        assert!(draw(&h).is_empty());
+        assert!(list(&h).is_empty());
         assert_eq!(h.next_name(), "snap-1");
         assert_eq!(history().next_name(), "snap-1");
     }
