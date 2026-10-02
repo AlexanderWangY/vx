@@ -61,7 +61,7 @@ impl Colors {
         self.paint("94", text)
     }
 
-    /// Bold black on cyan: a label that stands out, e.g. the snapshot a VM came from.
+    /// Bold black on cyan: a label that stands out, e.g. a VM's current snapshot.
     pub fn label_here<T: Display>(self, text: T) -> Paint<T> {
         self.paint("1;30;46", text)
     }

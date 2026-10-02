@@ -56,7 +56,7 @@ const OK: Style = Style::new().fg(Color::Green);
 /// Snapshots: one with memory, which resumes running; one of the disk alone, which boots.
 const LIVE: Style = Style::new().fg(Color::Green).add_modifier(Modifier::BOLD);
 const DISK: Style = Style::new().fg(Color::LightBlue);
-/// The snapshot the VM came from: a solid label, so it shows even on the selected row.
+/// The current snapshot: a solid label, so it shows even on the selected row.
 const HERE: Style = Style::new().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
 const WARN: Style = Style::new().fg(Color::Yellow);
 const ERROR: Style = Style::new().fg(Color::Red);
@@ -559,7 +559,7 @@ impl App {
         self.history_of(&self.snap_vm)
     }
 
-    /// The selected snapshot: the one picked, else the one the VM is at, else the newest.
+    /// The selected snapshot: the one picked, else the current one, else the newest.
     fn snap_pick(&self) -> Option<&snapshot::Entry> {
         let h = self.snap_history()?;
         let picked = self.snap_selected.as_deref().and_then(|name| h.get(name));
@@ -1406,8 +1406,7 @@ impl App {
         frame.render_widget(Paragraph::new(lines(cpu_rows, net_rows)), inner);
     }
 
-    /// The snapshots as a list, oldest first, like save slots. The one the VM came from is
-    /// highlighted.
+    /// The snapshots as a list, oldest first, like save slots, with the current one highlighted.
     fn snap_table(&self, spinner: char) -> Table<'static> {
         let Some(h) = self.snap_history() else { return Table::default() };
         let selected = self.snap_table.selected();
@@ -1419,7 +1418,7 @@ impl App {
             .enumerate()
             .map(|(i, entry)| {
                 // The selection is the row's own style rather than the table's highlight, which would
-                // paint over the label on the snapshot the VM came from.
+                // paint over the current snapshot's label.
                 let text = if selected == Some(i) { SELECTED.patch(SELECTED_TEXT) } else { Style::new() };
                 let here = h.current.as_deref() == Some(entry.snap.name.as_str());
                 let marker = marker(entry);
@@ -1429,7 +1428,7 @@ impl App {
                     n => Span::raw(bytes(n)),
                 };
                 // Where it was saved from, when that isn't the row above; and while a job runs,
-                // what it's doing, on the row the VM came from.
+                // what it's doing, on the current snapshot's row.
                 let mut note = Vec::new();
                 match &busy {
                     Some(busy) if here => note.push(Span::styled(format!("{spinner} {busy}"), BUSY)),
@@ -1497,11 +1496,11 @@ impl App {
             return;
         };
         if h.current.as_deref() == Some(e.snap.name.as_str()) {
-            let mut here = vec![Span::styled(format!("{vm} is here · "), ACCENT)];
+            let mut here = vec![Span::styled("current snapshot · ", ACCENT)];
             here.extend(state.spans);
             lines.push(Line::from(here));
         } else {
-            lines.push(Line::styled(format!("{vm} isn't here"), DIM));
+            lines.push(Line::styled("not the current snapshot", DIM));
         }
         lines.push(Line::default());
         let kind = match e.snap.memory {
@@ -1890,7 +1889,7 @@ fn marker(entry: &snapshot::Entry) -> Span<'static> {
     Span::styled(snapshot::marker(entry).to_string(), style)
 }
 
-/// A snapshot's name with a space either side, as a solid label if the VM came from it.
+/// A snapshot's name with a space either side, as a solid label if it's the current one.
 fn name_label(name: &str, max: usize, here: bool) -> Span<'static> {
     Span::styled(format!(" {} ", clip(name, max)), if here { HERE } else { Style::new() })
 }
@@ -1903,11 +1902,11 @@ fn snapshot_legend() -> Line<'static> {
         Span::styled("○", DISK),
         Span::styled(" boots from disk   ", DIM),
         Span::styled(" name ", HERE),
-        Span::styled(" currently running snapshot", DIM),
+        Span::styled(" current snapshot", DIM),
     ])
 }
 
-/// The VM pane's snapshot section: the newest few, with the one the VM is at highlighted.
+/// The VM pane's snapshot section: the newest few, with the current one highlighted.
 fn recent_snapshots(h: &History, width: usize) -> Vec<Line<'static>> {
     const SHOWN: usize = 3;
     let mut lines = vec![heading("SNAPSHOTS", h.entries.len().to_string(), width)];
@@ -2014,6 +2013,7 @@ const HELP: [&[(&str, &str)]; 2] = [
         ("esc", "back to VMs"),
         ("●", "resumes running: memory saved"),
         ("○", "boots from disk: disk only"),
+        ("cyan", "the current snapshot"),
         ("", ""),
         ("tab", "switch between VMs and images"),
         ("↑↓ j k", "select · g G first / last"),
@@ -2537,9 +2537,8 @@ mod tests {
             assert!(text.contains(want), "missing {want:?}:\n{text}");
         }
         let lines: Vec<&str> = text.lines().collect();
-        let legend = lines
-            .iter()
-            .position(|l| l.contains("● resumes running   ○ boots from disk    name  currently running snapshot"));
+        let legend =
+            lines.iter().position(|l| l.contains("● resumes running   ○ boots from disk    name  current snapshot"));
         assert_eq!(legend, Some(lines.len() - 3), "the legend, then a blank line above the keys:\n{text}");
         assert_eq!(lines[lines.len() - 2].trim_matches(['│', ' ']), "", "{text}");
         // The colors carry the meaning: green and blue markers, and a solid label for k8s.
@@ -2568,7 +2567,7 @@ mod tests {
             .sum();
         assert_eq!(notes, 1, "{text}");
 
-        // The VM came from k8s, so that's selected to start with.
+        // k8s is the current snapshot, so that's selected to start with.
         assert_eq!(app.snap_pick().unwrap().snap.name, "k8s");
         let _ = app.key(press(KeyCode::Up));
         assert_eq!(app.snap_pick().unwrap().snap.name, "nix-2");
@@ -2590,7 +2589,7 @@ mod tests {
         let back = job(&mut app, KeyCode::Char('s')).unwrap();
         assert_eq!(back.args, ["snap", "dev"], "saves first");
         assert_eq!(back.then.unwrap(), ["snap", "restore", "-y", "dev", "nix-2"]);
-        assert!(screen(&mut app, 100, 16).contains(" restoring"), "on the row the VM is at");
+        assert!(screen(&mut app, 100, 16).contains(" restoring"), "on the current snapshot's row");
         // Busy until it's done.
         let _ = app.key(press(KeyCode::Char('c')));
         assert!(app.modal.is_none());
@@ -2632,10 +2631,10 @@ mod tests {
         let _ = app.key(press(KeyCode::Char('g'))); // fresh
         let _ = app.key(press(KeyCode::Down)); // deps
         let text = screen(&mut app, 130, 20);
-        assert!(text.contains("─ deps ─") && text.contains("dev isn't here"), "{text}");
+        assert!(text.contains("─ deps ─") && text.contains("not the current snapshot"), "{text}");
         assert!(text.contains("memory and disk · 529 MB of memory") && text.contains("from   fresh"), "{text}");
         let _ = app.key(press(KeyCode::Char('G'))); // k8s, where it is
-        assert!(screen(&mut app, 130, 20).contains("dev is here · ● running"));
+        assert!(screen(&mut app, 130, 20).contains("current snapshot · ● running"));
 
         let _ = app.key(press(KeyCode::Esc));
         let text = screen(&mut app, 130, 30);

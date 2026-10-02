@@ -511,9 +511,13 @@ fn snap_ls(vm: &Vm) -> Result<()> {
     let state = backend::get(&vm.spec.backend)?.state(vm);
     match &history.current {
         Some(at) => {
-            println!("{} came from {} {}", vm.name, OUT.label_here(format!(" {at} ")), OUT.dim(format!("({state})")))
+            println!(
+                "current snapshot: {} {}",
+                OUT.label_here(format!(" {at} ")),
+                OUT.dim(format!("· {} is {state}", vm.name))
+            )
         }
-        None => println!("{} isn't from any of them {}", vm.name, OUT.dim(format!("({state})"))),
+        None => println!("no current snapshot {}", OUT.dim(format!("· {} is {state}", vm.name))),
     }
     println!(
         "{} {}   {} {}",

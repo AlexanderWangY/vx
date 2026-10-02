@@ -1,7 +1,8 @@
 //! Snapshots as save slots: each is the whole VM at one moment, independent of the others, so
 //! going back to one or deleting one never changes another. The backend keeps them (QEMU:
 //! inside disk.qcow2); vx adds what it doesn't record in the VM's snapshots.toml: a note, which
-//! snapshot each was saved from, and which one the VM came from last.
+//! snapshot each was saved from, and the current snapshot: the one the VM's state is based on,
+//! because it was the last one saved or gone back to.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -25,7 +26,7 @@ pub struct Entry {
     pub note: String,
 }
 
-/// A VM's snapshots, oldest first, and which one the VM came from.
+/// A VM's snapshots, oldest first, and the current one.
 #[derive(Debug, Default)]
 pub struct History {
     pub entries: Vec<Entry>,
@@ -209,7 +210,7 @@ mod tests {
         h
     }
 
-    /// Each snapshot with its `from` note, and `*` after the one the VM came from.
+    /// Each snapshot with its `from` note, and `*` after the current one.
     fn list(h: &History) -> Vec<String> {
         (0..h.entries.len())
             .map(|i| {

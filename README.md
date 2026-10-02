@@ -73,7 +73,7 @@ try-nix     1d ago  547 MB memory
 k8s         5h ago  547 MB memory  from deps · kind cluster up
 ```
 
-The one the VM came from is highlighted. `from deps` appears only after going back: when a snapshot wasn't saved right after the one above it.
+The current snapshot, the one the VM's state is based on, is highlighted. `from deps` appears only after going back: when a snapshot wasn't saved right after the one above it.
 
 In the dashboard, `S` opens the selected VM's snapshots and `ctrl-s` saves one right away. Snapshots live inside the VM's disk, so `vx rm` takes them with it.
 
