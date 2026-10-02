@@ -995,10 +995,11 @@ impl App {
         } else {
             (body, None)
         };
-        // The snapshot list's legend on the last line.
-        let body = if self.view == View::Snapshots && body.height > 4 {
-            let [list, legend] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(body);
-            frame.render_widget(Paragraph::new(snapshot_legend(&self.snap_vm)), legend);
+        // The snapshot list's legend at the bottom, a blank line clear of the keys in the border.
+        let body = if self.view == View::Snapshots && body.height > 5 {
+            let [list, legend, _] =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Length(1)]).areas(body);
+            frame.render_widget(Paragraph::new(snapshot_legend()), legend);
             list
         } else {
             body
@@ -1895,14 +1896,14 @@ fn name_label(name: &str, max: usize, here: bool) -> Span<'static> {
 }
 
 /// What the snapshot markers and the highlight mean.
-fn snapshot_legend(vm: &str) -> Line<'static> {
+fn snapshot_legend() -> Line<'static> {
     Line::from(vec![
         Span::styled("●", LIVE),
         Span::styled(" resumes running   ", DIM),
         Span::styled("○", DISK),
         Span::styled(" boots from disk   ", DIM),
         Span::styled(" name ", HERE),
-        Span::styled(format!(" where {vm} came from"), DIM),
+        Span::styled(" currently running snapshot", DIM),
     ])
 }
 
@@ -2535,7 +2536,12 @@ mod tests {
         for want in ["○  fresh ", "●  deps ", "○  try-nix ", "○  nix-2 ", "○  k8s "] {
             assert!(text.contains(want), "missing {want:?}:\n{text}");
         }
-        assert!(text.contains("● resumes running   ○ boots from disk    name  where dev came from"), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        let legend = lines
+            .iter()
+            .position(|l| l.contains("● resumes running   ○ boots from disk    name  currently running snapshot"));
+        assert_eq!(legend, Some(lines.len() - 3), "the legend, then a blank line above the keys:\n{text}");
+        assert_eq!(lines[lines.len() - 2].trim_matches(['│', ' ']), "", "{text}");
         // The colors carry the meaning: green and blue markers, and a solid label for k8s.
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
