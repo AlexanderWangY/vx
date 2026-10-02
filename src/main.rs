@@ -13,6 +13,7 @@ mod progress;
 mod qemu;
 mod qmp;
 mod seed;
+mod setup;
 mod snapshot;
 mod ssh;
 mod stats;
@@ -69,6 +70,12 @@ enum Command {
         /// A command to run instead of a shell
         #[arg(last = true)]
         command: Vec<String>,
+    },
+    /// Install packages in a VM; build-tools, python and a few others work on any distro
+    Install {
+        vm: String,
+        #[arg(required = true, value_name = "PACKAGES")]
+        packages: Vec<String>,
     },
     /// Copy files or directories into or out of a VM, starting it first if needed
     ///
@@ -214,6 +221,15 @@ struct NewArgs {
     /// Create the VM without starting it
     #[arg(long)]
     no_start: bool,
+    /// Packages to install, e.g. git,build-tools,python; added to the defaults in ~/.vx/config.toml
+    #[arg(long, value_delimiter = ',', value_name = "PACKAGES")]
+    install: Vec<String>,
+    /// A script on this machine to run in the VM, as you, once the packages are in
+    #[arg(long, value_name = "FILE")]
+    setup: Option<String>,
+    /// Skip the defaults in ~/.vx/config.toml
+    #[arg(long)]
+    bare: bool,
 }
 
 fn size(s: &str) -> Result<String, String> {
@@ -290,6 +306,11 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Cp { paths } => cp(&home, &paths)?,
+        Command::Install { vm, packages } => {
+            let vm = home.load(&vm)?;
+            let config = reachable(&home, &vm)?;
+            setup::install(&config, &vm, &packages)?;
+        }
         Command::Console { name } => {
             if let Some(vm) = pick(name, "console", "Which VM's console?", Some(State::Running))? {
                 attach(&vm)?;
@@ -362,7 +383,7 @@ fn new_args(home: &Home, args: NewArgs) -> Result<Option<NewArgs>> {
         return Err(hinted("vx new needs a name here", "vx new <name>; the form only opens in a terminal"));
     }
     let Some(args) = form::new_vm(home, args)? else { return Ok(None) };
-    eprintln!("  {}", ERR.dim(form::command_line(&args)?));
+    eprintln!("  {}", ERR.dim(form::command_line(home, &args)?));
     Ok(Some(args))
 }
 
@@ -641,6 +662,9 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
     spec.memory = args.mem.unwrap_or(spec.memory);
     spec.validate()?;
     source.check_arch(spec.arch)?;
+    let defaults = setup::Config::load(home)?;
+    let plan = setup::Plan::new(&defaults.new, args.bare, &args.install, args.setup.as_deref());
+    plan.check()?;
 
     // Check the tools exist before spending minutes on a download.
     let backend = backend::get(&spec.backend)?;
@@ -672,6 +696,10 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
     if args.no_start {
         let tip = format!("· start it with `vx start {}`", vm.name);
         eprintln!("  {check} {} created {}", ERR.bold(&vm.name), ERR.dim(tip));
+        if !plan.install.is_empty() {
+            let install = format!("vx install {} {}", vm.name, plan.install.join(" "));
+            style::warn("  ", format!("nothing was installed, since it didn't start; once it has: {install}"));
+        }
         return Ok(());
     }
     {
@@ -680,6 +708,12 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
     }
     ssh::wait_ready(&config, &vm, backend, boot_timeout(&vm))?;
     ssh::wait_cloud_init(&config, &vm)?;
+    if !plan.install.is_empty() {
+        setup::install(&config, &vm, &plan.install)?;
+    }
+    if let Some(script) = &plan.setup {
+        setup::run_script(&config, &vm, script)?;
+    }
     let took = format!("({} s)", started.elapsed().as_secs());
     let dot = ERR.dim("  ·  ");
     let name = &vm.name;
@@ -688,6 +722,10 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
         ERR.bold(name),
         ERR.dim(took)
     );
+    // Asked for by flag with no defaults yet: show how to stop typing them every time.
+    if !args.install.is_empty() && defaults.new.install.is_empty() && !args.bare {
+        eprintln!("  {}", ERR.dim(setup::tip(&args.install)));
+    }
     Ok(())
 }
 
