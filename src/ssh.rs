@@ -53,8 +53,13 @@ pub fn client_key(home: &Home) -> Result<String> {
 /// Generate the VM's sshd host key and pin it in known_hosts, so even the first connection
 /// is verified.
 pub fn host_key(vm: &Vm) -> Result<HostKey> {
+    keygen(&vm.path("host_key"), &alias(&vm.name))?;
+    pin_host_key(vm)
+}
+
+/// Pin the VM's existing host key in known_hosts, under the name it goes by now, and return it.
+pub fn pin_host_key(vm: &Vm) -> Result<HostKey> {
     let key = vm.path("host_key");
-    keygen(&key, &alias(&vm.name))?;
     let private = fs::read_to_string(&key)?;
     let public = fs::read_to_string(key.with_extension("pub"))?;
     let mut fields = public.split_whitespace();

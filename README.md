@@ -55,6 +55,7 @@ vx console <vm>                 # serial console, Ctrl-] to detach
 vx logs -f <vm>
 vx snap <vm> [name]             # see Snapshots below
 vx clone <vm>[@snapshot] [name] # a new VM that's a copy; see Clones below
+vx mv <vm> <new-name>           # rename it; its hostname follows
 vx rm <vm>
 ```
 
@@ -160,6 +161,7 @@ vx new dev --image mybox
 
 ## Tricks
 
+- `vx mv dev web` renames a VM, along with its hostname and its `ssh web.vx` alias. A running VM restarts to take the new name; `vx mv` asks first. In the dashboard, `r` renames the selected VM. Going back to a snapshot saved before the rename brings back the old hostname until the VM restarts.
 - `vx ssh dev -- uname -a` runs one command.
 - `vx cp ./src dev:` copies a whole directory into your home in the VM; `vx cp dev:build/app.log .` brings a file back. A path on the VM's side is relative to your home there.
 - Put `Include ~/.vx/vms/*/ssh_config` at the top of `~/.ssh/config`, then `ssh dev.vx`, `scp` and `rsync` just work.

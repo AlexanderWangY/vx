@@ -138,6 +138,17 @@ enum Command {
         #[arg(long)]
         no_start: bool,
     },
+    /// Rename a VM; a running one restarts to take its new name
+    #[command(alias = "rename")]
+    Mv {
+        /// The VM to rename
+        name: String,
+        /// Its new name
+        new_name: String,
+        /// Restart it without asking, if it's running
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Stop and delete a VM
     Rm {
         name: Option<String>,
@@ -408,6 +419,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Clone { source, name, no_start } => clone(&home, &source, name, no_start)?,
+        Command::Mv { name, new_name, yes } => mv(&home, home.load(&name)?, &new_name, yes)?,
         Command::Rm { name, yes } => {
             if let Some(vm) = pick(name, "rm", "Which VM do you want to delete?", None)? {
                 rm(vm, yes)?;
@@ -580,6 +592,59 @@ fn rm(vm: Vm, yes: bool) -> Result<()> {
     let name = vm.name.clone();
     vm.delete()?;
     println!("{} {name} deleted {}", OUT.green('✓'), OUT.dim("· cached images are kept"));
+    Ok(())
+}
+
+/// `vx mv`: a new name for the VM, its SSH alias and, from its next boot, its hostname.
+fn mv(home: &Home, vm: Vm, name: &str, yes: bool) -> Result<()> {
+    let backend = backend::get(&vm.spec.backend)?;
+    if vm.name == name {
+        println!("{}", OUT.dim(format!("{name} is called that already")));
+        return Ok(());
+    }
+    home.check_new_name(name)?;
+    let state = backend.state(&vm);
+    if let State::Other(state) = &state {
+        bail!("{} is {state}", vm.name);
+    }
+    // QEMU has the disk and its sockets open at their old paths, so it restarts around the move.
+    let running = state != State::Stopped;
+    if running && !yes {
+        let question = format!("{} is {state}; restart it to rename it?", ERR.bold(&vm.name));
+        let why = format!("not restarting {} without confirmation", vm.name);
+        if !ask(&question, why, format!("vx mv -y {} {name}", vm.name))? {
+            println!("left {} as it is", vm.name);
+            return Ok(());
+        }
+    }
+    let old = vm.name.clone();
+    let vm = {
+        let _lock = vm.lock()?;
+        if running {
+            backend.stop(&vm, false)?;
+        }
+        mount::stop_agent(&vm);
+        let vm = home.rename(vm, name)?;
+        // known_hosts pins the key under the VM's SSH alias, which is its name.
+        let host_key = ssh::pin_host_key(&vm)?;
+        // A new instance-id, so cloud-init sets the new hostname on its next boot, as for a
+        // clone; the host key stays the same.
+        seed::write(&vm, &ssh::client_key(home)?, &host_key)?;
+        vm
+    };
+    let config = ssh::write_config(home, &vm, backend.ssh_addr(&vm))?;
+    println!("{} {old} is now {name}", OUT.green('✓'));
+    if running {
+        {
+            let _lock = vm.lock()?;
+            backend.start(&vm)?;
+        }
+        ssh::wait_ready(&config, &vm, backend, boot_timeout(&vm))?;
+        ssh::wait_cloud_init(&config, &vm)?; // which sets the new hostname
+        println!("{} started {name} again {}", OUT.green('✓'), OUT.dim(format!("· vx ssh {name}")));
+    } else {
+        println!("{}", OUT.dim("its hostname changes too, when it next starts"));
+    }
     Ok(())
 }
 

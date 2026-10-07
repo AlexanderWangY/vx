@@ -171,6 +171,15 @@ impl Home {
         Ok(vm)
     }
 
+    /// Give `vm` a new name, which moves its directory. The caller stops it first: a running
+    /// backend has paths in the old directory open.
+    pub fn rename(&self, vm: Vm, name: &str) -> Result<Vm> {
+        self.check_new_name(name)?;
+        let dir = self.vms().join(name);
+        fs::rename(&vm.dir, &dir).with_context(|| format!("moving {} to {}", vm.dir.display(), dir.display()))?;
+        Ok(Vm { name: name.into(), dir, spec: vm.spec })
+    }
+
     /// A free name for a copy of `from`: `dev-2`, or `dev-3` if that's taken, and so on.
     /// A copy of `dev-2` is `dev-3`, not `dev-2-2`.
     pub fn clone_name(&self, from: &str) -> String {
@@ -671,6 +680,22 @@ mod tests {
         home.create("dev", s, |_| Ok(())).unwrap();
         let port = home.next_ssh_port().unwrap();
         assert!(port > FIRST_SSH_PORT + 1, "{port}");
+    }
+
+    #[test]
+    fn rename_moves_the_directory() {
+        let home = TempHome::new();
+        let vm = home.create("dev", spec(), |vm| Ok(fs::write(vm.path("disk.qcow2"), "")?)).unwrap();
+        let vm = home.rename(vm, "web").unwrap();
+        assert_eq!(vm.name, "web");
+        assert!(vm.path("disk.qcow2").exists());
+        assert_eq!(home.names().unwrap(), ["web"]);
+        assert_eq!(home.load("web").unwrap().spec, spec());
+
+        let other = home.create("dev", spec(), |_| Ok(())).unwrap();
+        let e = home.rename(other, "web").unwrap_err();
+        assert!(hint(&e).unwrap().contains("vx rm web"), "a name that's taken");
+        assert_eq!(home.names().unwrap(), ["dev", "web"]);
     }
 
     #[test]
