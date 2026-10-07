@@ -980,10 +980,25 @@ impl SnapForm {
     }
 }
 
+/// How much this machine can give a VM, which the settings form holds it to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limits {
+    pub cpus: u32,
+    /// Bytes, when known.
+    pub memory: Option<u64>,
+}
+
+impl Limits {
+    pub fn host() -> Limits {
+        Limits { cpus: set::max_cpus(), memory: crate::host::memory() }
+    }
+}
+
 /// A VM's CPUs, memory and disk (`vx set`).
 pub struct SettingsForm {
     vm: String,
     running: bool,
+    limits: Limits,
     cpus: u32,
     memory: String,
     disk: u64,
@@ -996,25 +1011,26 @@ impl SettingsForm {
     pub const HEIGHT: u16 = 6;
 
     /// `disk` is its size now, in bytes, if that's known. Left empty, the disk stays as it is.
-    pub fn new(vm: &str, spec: &Spec, running: bool, disk: Option<u64>) -> SettingsForm {
+    pub fn new(vm: &str, spec: &Spec, running: bool, disk: Option<u64>, limits: Limits) -> SettingsForm {
         let inputs = [
             Input::new(&spec.cpus.to_string()),
             Input::new(&spec.memory),
             Input::new(&disk.map(vx::show_size).unwrap_or_default()),
         ];
         let disk = disk.unwrap_or_default();
-        SettingsForm { vm: vm.into(), running, cpus: spec.cpus, memory: spec.memory.clone(), disk, focus: 0, inputs }
+        let memory = spec.memory.clone();
+        SettingsForm { vm: vm.into(), running, limits, cpus: spec.cpus, memory, disk, focus: 0, inputs }
     }
 
     fn problem(&self) -> Option<(usize, String)> {
         let [cpus, memory, disk] = &self.inputs;
-        let max = set::max_cpus();
+        let max = self.limits.cpus;
         if !cpus.text.parse::<u32>().is_ok_and(|c| (1..=max).contains(&c)) {
             return Some((0, format!("1 to {max} CPUs, as many as this machine has")));
         }
         match vx::size_bytes(&memory.text) {
             None => return Some((1, "memory like 4G or 512M".into())),
-            Some(m) if crate::host::memory().is_some_and(|host| m > host) => {
+            Some(m) if self.limits.memory.is_some_and(|host| m > host) => {
                 return Some((1, "more memory than this machine has".into()));
             }
             Some(_) => {}

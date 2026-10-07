@@ -37,7 +37,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::NewArgs;
 use crate::backend::{self, State};
 use crate::form::{
-    AddImageForm, CloneForm, NewForm, NewImage, NewSnap, PortChange, PortsForm, SettingsForm, SnapForm, Step,
+    AddImageForm, CloneForm, Limits, NewForm, NewImage, NewSnap, PortChange, PortsForm, SettingsForm, SnapForm, Step,
 };
 use crate::host::Arch;
 use crate::image::{self, Info};
@@ -396,6 +396,8 @@ struct Status {
 struct App {
     home: Home,
     host: Arch,
+    /// What this machine can give a VM; pinned in tests, which run on all sorts of machines.
+    limits: Limits,
     view: View,
     /// `None` until the first refresh arrives.
     vms: Option<Vec<Entry>>,
@@ -432,6 +434,7 @@ impl App {
         App {
             home: Home::at(home.root()),
             host,
+            limits: Limits::host(),
             view: View::Vms,
             vms: None,
             images: Vec::new(),
@@ -904,7 +907,7 @@ impl App {
                         .ok()
                         .and_then(|b| b.disks())
                         .and_then(|d| self.home.load(&name).ok().and_then(|vm| d.disk_size(&vm).ok()));
-                    let form = SettingsForm::new(&name, spec, state != State::Stopped, disk);
+                    let form = SettingsForm::new(&name, spec, state != State::Stopped, disk, self.limits);
                     self.modal = Some(Modal::Settings(name, Box::new(form)));
                 }
             }
@@ -2772,13 +2775,14 @@ mod tests {
     fn settings_dialog_runs_vx_set() {
         // dev runs, so changing its CPUs says it restarts, and does.
         let mut app = with_vms();
+        app.limits = Limits { cpus: 8, memory: Some(16 << 30) };
         let _ = app.key(press(KeyCode::Char('e')));
         let text = screen(&mut app, 100, 16);
         assert!(text.contains("─ dev's settings ─") && text.contains("CPUs    4 ✓"), "{text}");
         assert!(text.contains("enter save ·"), "nothing changed, so no restart:\n{text}");
         let _ = app.key(press(KeyCode::Backspace));
         typed(&mut app, "99");
-        assert!(screen(&mut app, 100, 16).contains("as many as this machine has"));
+        assert!(screen(&mut app, 100, 16).contains("1 to 8 CPUs, as many as this machine has"));
         let _ = app.key(press(KeyCode::Backspace));
         let _ = app.key(press(KeyCode::Backspace));
         typed(&mut app, "2");
@@ -2791,6 +2795,7 @@ mod tests {
 
         // web is stopped, so nothing restarts; letters become units.
         let mut app = with_vms();
+        app.limits = Limits { cpus: 8, memory: Some(16 << 30) };
         let _ = app.key(press(KeyCode::Down));
         let _ = app.key(press(KeyCode::Char('e')));
         let _ = app.key(press(KeyCode::Tab));
@@ -2801,6 +2806,7 @@ mod tests {
 
         // Nothing changed: it just closes.
         let mut app = with_vms();
+        app.limits = Limits { cpus: 8, memory: Some(16 << 30) };
         let _ = app.key(press(KeyCode::Char('e')));
         assert_eq!(app.key(press(KeyCode::Enter)), Action::None);
         assert!(app.modal.is_none());
