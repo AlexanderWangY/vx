@@ -11,7 +11,7 @@ use std::{fs, io, thread};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
-use crate::backend::{Backend, Check, Clones, CommandLine, Console, Forwards, Pause, Snap, Snapshots, State};
+use crate::backend::{Backend, Check, Clones, CommandLine, Console, Disks, Forwards, Pause, Snap, Snapshots, State};
 use crate::host::{self, Arch, Os};
 use crate::style::{self, ERR};
 use crate::vx::Vm;
@@ -87,6 +87,13 @@ impl Backend for Qemu {
         fs::metadata(vm.path("disk.qcow2")).ok().map(|m| m.blocks() * 512)
     }
 
+    fn running_size(&self, vm: &Vm) -> Option<(u32, u64)> {
+        let sock = vm.path("qmp.sock");
+        let cpus = qmp::call(&sock, "query-cpus-fast").ok()?.as_array()?.len() as u32;
+        let memory = qmp::call(&sock, "query-memory-size-summary").ok()?["base-memory"].as_u64()?;
+        Some((cpus, memory))
+    }
+
     fn checks(&self) -> Vec<Check> {
         let hint = Some(probe::install_hint(Os::host()).to_string());
         let qemu = Arch::host().and_then(Host::probe);
@@ -117,6 +124,10 @@ impl Backend for Qemu {
     }
 
     fn clones(&self) -> Option<&dyn Clones> {
+        Some(self)
+    }
+
+    fn disks(&self) -> Option<&dyn Disks> {
         Some(self)
     }
 }
@@ -344,6 +355,32 @@ impl Clones for Qemu {
                 }
                 copied
             }
+        }
+    }
+}
+
+impl Disks for Qemu {
+    fn disk_size(&self, vm: &Vm) -> Result<u64> {
+        // -U: QEMU may have it open.
+        let info = host::run(qemu_img()?.args(["info", "-U", "--output=json"]).arg(vm.path("disk.qcow2")))?;
+        let info: Value = serde_json::from_str(&info).context("reading qemu-img info")?;
+        info["virtual-size"].as_u64().context("qemu-img info has no virtual-size")
+    }
+
+    fn grow_disk(&self, vm: &Vm, bytes: u64) -> Result<()> {
+        ensure!(bytes >= self.disk_size(vm)?, "disks can only grow");
+        match self.state(vm) {
+            State::Stopped => {
+                host::run(qemu_img()?.args(["resize", "-q"]).arg(vm.path("disk.qcow2")).arg(bytes.to_string()))?;
+                Ok(())
+            }
+            State::Other(state) => bail!("{} is {state}", vm.name),
+            _ => qmp::call_with(
+                &vm.path("qmp.sock"),
+                "block_resize",
+                json!({ "node-name": node_name(vm)?, "size": bytes }),
+            )
+            .map(drop),
         }
     }
 }

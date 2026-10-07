@@ -4,6 +4,8 @@ The Release workflow uses the section matching each version as its GitHub Releas
 
 ## Unreleased
 
+- **Change a VM's CPUs, memory and disk.** `vx set dev --cpus 8 --mem 16G --disk 40G`, or `--disk +20G` for that much more; `vx set dev` shows them. A disk grows straight away, even while the VM runs, and so does its filesystem. New CPUs and memory take effect on restart, which `vx set` offers, or `--restart` does. In the dashboard, `e` changes them.
+
 - **Clones.** `vx clone dev` makes `dev-2`, a new VM with a copy of `dev`'s disk and a name, hostname, SSH port and host key of its own; `vx clone dev web` names it, and `vx clone dev@deps` copies `dev` as it was at a snapshot. A stopped VM is copied instantly; a running one keeps running. In the dashboard, `C` clones the selected VM, or the selected snapshot.
 - `vx snap` has a running VM write what it's holding in memory to its disk first, so a snapshot's disk is complete on its own, for cloning.
 

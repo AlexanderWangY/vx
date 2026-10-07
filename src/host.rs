@@ -65,6 +65,22 @@ impl fmt::Display for Arch {
 }
 
 /// The first executable called `name` on PATH.
+/// This machine's memory, in bytes.
+pub fn memory() -> Option<u64> {
+    match Os::host() {
+        Os::Macos => {
+            let out =
+                Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).stderr(Stdio::null()).output().ok()?;
+            String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+        }
+        Os::Linux => {
+            let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+            let kb = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.trim().strip_suffix("kB")?;
+            kb.trim().parse::<u64>().ok().map(|kb| kb * 1024)
+        }
+    }
+}
+
 pub fn which(name: &str) -> Option<PathBuf> {
     env::split_paths(&env::var_os("PATH")?).map(|dir| dir.join(name)).find(|p| is_executable(p))
 }

@@ -14,6 +14,7 @@ mod progress;
 mod qemu;
 mod qmp;
 mod seed;
+mod set;
 mod setup;
 mod snapshot;
 mod ssh;
@@ -97,6 +98,29 @@ enum Command {
         /// Keep printing new output
         #[arg(short, long)]
         follow: bool,
+    },
+    /// Change a VM's CPUs, memory or disk, or see them
+    ///
+    ///   vx set dev                    see them
+    ///   vx set dev --cpus 8 --mem 16G
+    ///   vx set dev --disk 40G         grows it, even while dev runs
+    ///   vx set dev --disk +20G        20G more
+    #[command(verbatim_doc_comment)]
+    Set {
+        /// The VM (leave it out to pick one)
+        name: Option<String>,
+        /// Virtual CPUs
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Memory, e.g. 8G or 512M
+        #[arg(long, value_parser = size)]
+        mem: Option<String>,
+        /// Disk size, e.g. 40G, or +20G for that much more; disks only grow
+        #[arg(long, value_parser = set::parse_disk)]
+        disk: Option<String>,
+        /// Restart a running VM so new CPUs and memory take effect, without asking
+        #[arg(long)]
+        restart: bool,
     },
     /// Make a new VM that's a copy of another, or of one of its snapshots
     ///
@@ -376,6 +400,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Logs { name, follow } => {
             if let Some(vm) = pick(name, "logs", "Which VM's boot log?", None)? {
                 console::logs(&vm, follow)?;
+            }
+        }
+        Command::Set { name, cpus, mem, disk, restart } => {
+            if let Some(mut vm) = pick(name, "set", "Which VM do you want to change?", None)? {
+                set::run(&home, &mut vm, set::Changes { cpus, memory: mem, disk }, restart)?;
             }
         }
         Command::Clone { source, name, no_start } => clone(&home, &source, name, no_start)?,

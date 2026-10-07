@@ -45,6 +45,7 @@ vx new web --image fedora-44 --cpus 2 --mem 8G --disk 40G
 vx new                          # no name: fill in a form
 vx install <vm> <package>...    # see "Set up new VMs your way" below
 vx ls
+vx set <vm> [--cpus 8] [--mem 16G] [--disk +20G]   # change them, or see them
 vx start | stop | pause | resume <vm>
 vx ssh <vm> [-- cmd]            # starts it first if needed
 vx cp <path>... <vm>:<path>     # copy in; or <vm>:<path>... <path> to copy out
@@ -117,6 +118,18 @@ k8s         5h ago  547 MB memory  from deps · kind cluster up
 The current snapshot, the one the VM's state is based on, is highlighted. `from deps` appears only after going back: when a snapshot wasn't saved right after the one above it.
 
 In the dashboard, `S` opens the selected VM's snapshots and `ctrl-s` saves one right away. Snapshots live inside the VM's disk, so `vx rm` takes them with it.
+
+## Changing CPUs, memory and disk
+
+```
+vx set dev                      # dev: 4 CPUs · 4G memory · 20G disk
+vx set dev --cpus 8 --mem 16G
+vx set dev --disk 40G           # or --disk +20G for 20G more
+```
+
+A disk grows straight away, even while the VM runs, and so does its filesystem. Disks only grow. New CPUs and memory take effect when the VM restarts: `vx set` asks whether to restart it now, or `--restart` does without asking.
+
+In the dashboard, `e` changes the selected VM's.
 
 ## Clones
 

@@ -36,7 +36,9 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::NewArgs;
 use crate::backend::{self, State};
-use crate::form::{AddImageForm, CloneForm, NewForm, NewImage, NewSnap, PortChange, PortsForm, SnapForm, Step};
+use crate::form::{
+    AddImageForm, CloneForm, NewForm, NewImage, NewSnap, PortChange, PortsForm, SettingsForm, SnapForm, Step,
+};
 use crate::host::Arch;
 use crate::image::{self, Info};
 use crate::progress::bytes;
@@ -211,6 +213,7 @@ enum Verb {
     DeleteSnapshot,
     Forward,
     Unforward,
+    Set,
 }
 
 impl Verb {
@@ -244,6 +247,7 @@ impl Verb {
             Verb::DeleteSnapshot => "deleting",
             Verb::Forward => "forwarding",
             Verb::Unforward => "unforwarding",
+            Verb::Set => "changing",
         }
     }
 
@@ -262,6 +266,7 @@ impl Verb {
             Verb::DeleteSnapshot => "deleted",
             Verb::Forward => "forwarded",
             Verb::Unforward => "unforwarded",
+            Verb::Set => "changed",
         }
     }
 }
@@ -283,6 +288,7 @@ impl fmt::Display for Verb {
             Verb::DeleteSnapshot => "delete",
             Verb::Forward => "forward a port to",
             Verb::Unforward => "stop forwarding a port to",
+            Verb::Set => "change",
         })
     }
 }
@@ -356,6 +362,8 @@ enum Modal {
     AddImage(Box<AddImageForm>),
     Snap(Box<SnapForm>),
     Clone(Box<CloneForm>),
+    /// The CPUs, memory and disk of this VM.
+    Settings(String, Box<SettingsForm>),
     /// The ports of this VM.
     Ports(String, Box<PortsForm>),
     /// Asking before restoring the snapshot view's VM to this snapshot.
@@ -791,6 +799,20 @@ impl App {
                 Step::Cancel => {}
                 Step::Continue => self.modal = Some(Modal::Snap(form)),
             },
+            Modal::Settings(vm, mut form) => match form.handle(key) {
+                // Nothing changed.
+                Step::Done(args) if args.len() == 2 => {}
+                Step::Done(args) => {
+                    let done = if args.iter().any(|a| a == "--restart") {
+                        format!("✓ changed {vm} and restarted it")
+                    } else {
+                        format!("✓ changed {vm}")
+                    };
+                    return self.vm_task(vm, Verb::Set, args, None, done);
+                }
+                Step::Cancel => {}
+                Step::Continue => self.modal = Some(Modal::Settings(vm, form)),
+            },
             Modal::Clone(mut form) => match form.handle(key) {
                 Step::Done(args) => return self.clone_vm(args),
                 Step::Cancel => {}
@@ -872,6 +894,18 @@ impl App {
             KeyCode::Char('S') => {
                 if let Some((name, _)) = self.target() {
                     self.open_snapshots(name);
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some((name, state)) = self.target()
+                    && let Some(Entry { vm: Ok((spec, _)), .. }) = self.selected()
+                {
+                    let disk = backend::get(&spec.backend)
+                        .ok()
+                        .and_then(|b| b.disks())
+                        .and_then(|d| self.home.load(&name).ok().and_then(|vm| d.disk_size(&vm).ok()));
+                    let form = SettingsForm::new(&name, spec, state != State::Stopped, disk);
+                    self.modal = Some(Modal::Settings(name, Box::new(form)));
                 }
             }
             KeyCode::Char('C') => {
@@ -1185,6 +1219,10 @@ impl App {
             }
             Some(Modal::Snap(form)) => {
                 let inner = dialog(frame, area, 72, SnapForm::HEIGHT + 4, "snapshot", BORDER, 2);
+                form.render(frame, inner);
+            }
+            Some(Modal::Settings(vm, form)) => {
+                let inner = dialog(frame, area, 72, SettingsForm::HEIGHT + 4, &format!("{vm}'s settings"), BORDER, 2);
                 form.render(frame, inner);
             }
             Some(Modal::Clone(form)) => {
@@ -2113,6 +2151,7 @@ const HELP: [&[(&str, &str)]; 2] = [
         ("f", "forward ports"),
         ("S", "snapshots"),
         ("ctrl-s", "save a snapshot now"),
+        ("e", "CPUs, memory and disk"),
         ("C", "clone: a new VM that's a copy"),
         ("", ""),
         ("", "images"),
@@ -2727,6 +2766,44 @@ mod tests {
         typed(&mut app, "before upgrade");
         let save = job(&mut app, KeyCode::Enter).unwrap();
         assert_eq!(save.args, ["snap", "dev", "snap-1x", "-m", "before upgrade"]);
+    }
+
+    #[test]
+    fn settings_dialog_runs_vx_set() {
+        // dev runs, so changing its CPUs says it restarts, and does.
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Char('e')));
+        let text = screen(&mut app, 100, 16);
+        assert!(text.contains("─ dev's settings ─") && text.contains("CPUs    4 ✓"), "{text}");
+        assert!(text.contains("enter save ·"), "nothing changed, so no restart:\n{text}");
+        let _ = app.key(press(KeyCode::Backspace));
+        typed(&mut app, "99");
+        assert!(screen(&mut app, 100, 16).contains("as many as this machine has"));
+        let _ = app.key(press(KeyCode::Backspace));
+        let _ = app.key(press(KeyCode::Backspace));
+        typed(&mut app, "2");
+        let text = screen(&mut app, 100, 16);
+        assert!(text.contains("dev restarts so its CPUs and memory change"), "{text}");
+        assert!(text.contains("enter save and restart"), "{text}");
+        let set = job(&mut app, KeyCode::Enter).unwrap();
+        assert_eq!(set.args, ["set", "dev", "--cpus", "2", "--restart"]);
+        assert_eq!(set.done.as_deref(), Some("✓ changed dev and restarted it"));
+
+        // web is stopped, so nothing restarts; letters become units.
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Down));
+        let _ = app.key(press(KeyCode::Char('e')));
+        let _ = app.key(press(KeyCode::Tab));
+        let _ = app.key(press(KeyCode::Backspace));
+        let _ = app.key(press(KeyCode::Backspace));
+        typed(&mut app, "8g");
+        assert_eq!(job(&mut app, KeyCode::Enter).unwrap().args, ["set", "web", "--mem", "8G"]);
+
+        // Nothing changed: it just closes.
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Char('e')));
+        assert_eq!(app.key(press(KeyCode::Enter)), Action::None);
+        assert!(app.modal.is_none());
     }
 
     #[test]
