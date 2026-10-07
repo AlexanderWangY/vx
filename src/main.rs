@@ -25,7 +25,7 @@ mod vx;
 
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -97,6 +97,22 @@ enum Command {
         /// Keep printing new output
         #[arg(short, long)]
         follow: bool,
+    },
+    /// Make a new VM that's a copy of another, or of one of its snapshots
+    ///
+    ///   vx clone dev             dev-2, a copy of dev as it is now
+    ///   vx clone dev web         named web
+    ///   vx clone dev@deps web    dev as it was at snapshot deps
+    #[command(verbatim_doc_comment)]
+    Clone {
+        /// The VM to copy, or <vm>@<snapshot>
+        #[arg(value_name = "VM[@SNAPSHOT]")]
+        source: String,
+        /// What to call the copy [default: <vm>-2, <vm>-3, …]
+        name: Option<String>,
+        /// Create it without starting it
+        #[arg(long)]
+        no_start: bool,
     },
     /// Stop and delete a VM
     Rm {
@@ -362,6 +378,7 @@ fn run(cli: Cli) -> Result<()> {
                 console::logs(&vm, follow)?;
             }
         }
+        Command::Clone { source, name, no_start } => clone(&home, &source, name, no_start)?,
         Command::Rm { name, yes } => {
             if let Some(vm) = pick(name, "rm", "Which VM do you want to delete?", None)? {
                 rm(vm, yes)?;
@@ -581,7 +598,10 @@ fn snap(home: &Home, vm: &Vm, name: Option<String>, note: String) -> Result<()> 
         State::Running => {
             let config = ssh::write_config(home, vm, backend::get(&vm.spec.backend)?.ssh_addr(vm))?;
             let up = ssh::reachable(&config, vm);
-            if !up {
+            if up {
+                // So the disk alone is complete too, for `vx clone <vm>@<snapshot>`.
+                ssh::sync(&config, vm);
+            } else {
                 style::warn("", format!("{} is still booting, so only its disk is saved", vm.name));
             }
             up
@@ -767,12 +787,7 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
         }
         return Ok(());
     }
-    {
-        let _lock = vm.lock()?;
-        backend.start(&vm)?;
-    }
-    ssh::wait_ready(&config, &vm, backend, boot_timeout(&vm))?;
-    ssh::wait_cloud_init(&config, &vm)?;
+    first_boot(&vm, backend, &config)?;
     if !plan.install.is_empty() {
         setup::install(&config, &vm, &plan.install)?;
     }
@@ -784,30 +799,128 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
         vm.spec.mounts = mounts;
         vm.save()?;
         mount::ensure_agent(&vm)?;
-        let failed = mount::wait(&vm, |_| true, Duration::from_secs(60));
-        let ok: Vec<&str> =
-            vm.spec.mounts.iter().filter(|m| !failed.iter().any(|(f, _)| f == *m)).map(|m| m.guest.as_str()).collect();
-        if !ok.is_empty() {
-            eprintln!("  {} mounted {}", ERR.green('✓'), ok.join(", "));
-        }
-        mount::report(&vm, &failed);
+        wait_for_mounts(&vm);
         vm
     };
     if let Some(script) = &plan.setup {
         setup::run_script(&config, &vm, script)?;
     }
-    let took = format!("({} s)", started.elapsed().as_secs());
-    let dot = ERR.dim("  ·  ");
-    let name = &vm.name;
-    eprintln!(
-        "  {check} {} is ready {}    vx ssh {name}{dot}vx console {name}{dot}vx stop {name}",
-        ERR.bold(name),
-        ERR.dim(took)
-    );
+    ready(&vm, started);
     // Asked for by flag with no defaults yet: show how to stop typing them every time.
     if !args.install.is_empty() && defaults.new.install.is_empty() && !args.bare {
         eprintln!("  {}", ERR.dim(setup::tip(&args.install)));
     }
+    Ok(())
+}
+
+/// Start a VM that's never run, and wait for it to accept logins and for cloud-init to set it up.
+fn first_boot(vm: &Vm, backend: &dyn backend::Backend, config: &Path) -> Result<()> {
+    {
+        let _lock = vm.lock()?;
+        backend.start(vm)?;
+    }
+    ssh::wait_ready(config, vm, backend, boot_timeout(vm))?;
+    ssh::wait_cloud_init(config, vm)
+}
+
+/// Wait for a new VM's folders to be mounted, and say which are.
+fn wait_for_mounts(vm: &Vm) {
+    let failed = mount::wait(vm, |_| true, Duration::from_secs(60));
+    let ok: Vec<&str> =
+        vm.spec.mounts.iter().filter(|m| !failed.iter().any(|(f, _)| f == *m)).map(|m| m.guest.as_str()).collect();
+    if !ok.is_empty() {
+        eprintln!("  {} mounted {}", ERR.green('✓'), ok.join(", "));
+    }
+    mount::report(vm, &failed);
+}
+
+fn ready(vm: &Vm, started: Instant) {
+    let took = format!("({} s)", started.elapsed().as_secs());
+    let dot = ERR.dim("  ·  ");
+    let name = &vm.name;
+    eprintln!(
+        "  {} {} is ready {}    vx ssh {name}{dot}vx console {name}{dot}vx stop {name}",
+        ERR.green('✓'),
+        ERR.bold(name),
+        ERR.dim(took)
+    );
+}
+
+/// `vx clone`: a new VM whose disk is a copy of `source`'s (`dev`, or `dev@snapshot` for its
+/// disk as it was then), with an identity of its own: name, hostname, SSH port and host key.
+fn clone(home: &Home, source: &str, name: Option<String>, no_start: bool) -> Result<()> {
+    let started = Instant::now();
+    let (from_name, snap) = match source.split_once('@') {
+        Some((vm, snap)) => (vm, Some(snap)),
+        None => (source, None),
+    };
+    let from = home.load(from_name)?;
+    let backend = backend::get(&from.spec.backend)?;
+    let Some(clones) = backend.clones() else {
+        bail!("the {} backend can't clone VMs", from.spec.backend);
+    };
+    let memory = match snap {
+        Some(snap) => History::load(&from, snapshots(&from)?)?.find(&from, snap)?.snap.memory > 0,
+        None => false,
+    };
+    let name = name.unwrap_or_else(|| home.clone_name(&from.name));
+    home.check_new_name(&name)?;
+    let state = backend.state(&from);
+    if let State::Other(state) = &state {
+        bail!("{} is {state}", from.name);
+    }
+    let mut spec = from.spec.clone();
+    // They'd clash with the source's, which keeps them.
+    let ports = std::mem::take(&mut spec.forward);
+    spec.ssh.port = home.next_ssh_port()?;
+    let client_key = ssh::client_key(home)?;
+
+    let dot = ERR.dim(" · ");
+    let what = match snap {
+        Some(snap) => format!("{} at {snap}", from.name),
+        None => from.name.clone(),
+    };
+    let note = match (snap, &state) {
+        (Some(_), _) if memory => "its disk; it boots fresh",
+        (None, State::Running) => "its disk as it is now; it keeps running",
+        _ => "",
+    };
+    eprintln!(
+        "  {}{}",
+        ERR.bold(format!("{what} → {name}")),
+        if note.is_empty() { String::new() } else { format!("{dot}{}", ERR.dim(note)) }
+    );
+    let vm = {
+        let _source = from.lock()?;
+        if snap.is_none() && state == State::Running {
+            // Gets what the guest has written but not yet put on disk into the copy.
+            ssh::sync(&ssh::write_config(home, &from, backend.ssh_addr(&from))?, &from);
+        }
+        home.create(&name, spec, |vm| {
+            clones.clone_disk(&from, snap, vm)?;
+            // A new host key, and a new instance-id, so cloud-init sets it up as a machine of
+            // its own on first boot: its hostname, and the key.
+            let host_key = ssh::host_key(vm)?;
+            seed::write(vm, &client_key, &host_key)
+        })?
+    };
+    let config = ssh::write_config(home, &vm, backend.ssh_addr(&vm))?;
+    let check = ERR.green('✓');
+    eprintln!("  {check} disk  {check} keys  {check} cloud-init  {check} ssh port {}", vm.spec.ssh.port);
+    if !ports.is_empty() {
+        let tip = format!("forward others with `vx port {} …`", vm.name);
+        eprintln!("  {}", ERR.dim(format!("{}'s forwarded ports stay with it; {tip}", from.name)));
+    }
+    if no_start {
+        let tip = format!("· start it with `vx start {}`", vm.name);
+        eprintln!("  {check} {} created {}", ERR.bold(&vm.name), ERR.dim(tip));
+        return Ok(());
+    }
+    first_boot(&vm, backend, &config)?;
+    if !vm.spec.mounts.is_empty() {
+        wait_for_mounts(&vm);
+    }
+    ready(&vm, started);
     Ok(())
 }
 

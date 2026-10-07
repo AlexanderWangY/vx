@@ -4,6 +4,9 @@ The Release workflow uses the section matching each version as its GitHub Releas
 
 ## Unreleased
 
+- **Clones.** `vx clone dev` makes `dev-2`, a new VM with a copy of `dev`'s disk and a name, hostname, SSH port and host key of its own; `vx clone dev web` names it, and `vx clone dev@deps` copies `dev` as it was at a snapshot. A stopped VM is copied instantly; a running one keeps running. In the dashboard, `C` clones the selected VM, or the selected snapshot.
+- `vx snap` has a running VM write what it's holding in memory to its disk first, so a snapshot's disk is complete on its own, for cloning.
+
 - **Shared folders.** `vx mount dev ~/code` makes `~/code` here show up at `~/code` in `dev`, live both ways, or `vx mount dev .:/srv/app` puts it somewhere else. `--ro` shares it read-only, `vx mount dev` lists them, `vx mount rm dev ~/code` stops sharing one, and `vx new --mount` shares one from the start. A running VM gets it straight away, and it's saved in `vx.toml` for next time. It works on every built-in distro: sshfs over vx's SSH connection, installed in the VM the first time.
 - `sshfs` is one of the package names `vx install` translates for each distro.
 

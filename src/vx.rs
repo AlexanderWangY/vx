@@ -171,6 +171,13 @@ impl Home {
         Ok(vm)
     }
 
+    /// A free name for a copy of `from`: `dev-2`, or `dev-3` if that's taken, and so on.
+    /// A copy of `dev-2` is `dev-3`, not `dev-2-2`.
+    pub fn clone_name(&self, from: &str) -> String {
+        let base = from.rsplit_once('-').filter(|(_, n)| n.parse::<u32>().is_ok()).map_or(from, |(base, _)| base);
+        (2..1000).map(|n| format!("{base}-{n}")).find(|name| self.check_new_name(name).is_ok()).unwrap_or_default()
+    }
+
     /// The lowest port ≥ 2222 that no VM claims and nothing on this host is listening on.
     pub fn next_ssh_port(&self) -> Result<u16> {
         let mut claimed = HashSet::new();
@@ -626,6 +633,16 @@ mod tests {
         home.create("dev", s, |_| Ok(())).unwrap();
         let port = home.next_ssh_port().unwrap();
         assert!(port > FIRST_SSH_PORT + 1, "{port}");
+    }
+
+    #[test]
+    fn clone_names() {
+        let home = TempHome::new();
+        assert_eq!(home.clone_name("dev"), "dev-2");
+        home.create("dev-2", spec(), |_| Ok(())).unwrap();
+        assert_eq!(home.clone_name("dev"), "dev-3");
+        assert_eq!(home.clone_name("dev-2"), "dev-3");
+        assert_eq!(home.clone_name("web-api"), "web-api-2");
     }
 
     #[test]

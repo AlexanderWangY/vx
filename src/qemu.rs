@@ -11,11 +11,11 @@ use std::{fs, io, thread};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
-use crate::backend::{Backend, Check, CommandLine, Console, Forwards, Pause, Snap, Snapshots, State};
+use crate::backend::{Backend, Check, Clones, CommandLine, Console, Forwards, Pause, Snap, Snapshots, State};
 use crate::host::{self, Arch, Os};
 use crate::style::{self, ERR};
 use crate::vx::Vm;
-use crate::{hinted, mount, qmp};
+use crate::{hinted, mount, progress, qmp};
 use probe::Host;
 
 /// How long a guest gets to react to the power button before it's forced off.
@@ -113,6 +113,10 @@ impl Backend for Qemu {
     }
 
     fn forwards(&self) -> Option<&dyn Forwards> {
+        Some(self)
+    }
+
+    fn clones(&self) -> Option<&dyn Clones> {
         Some(self)
     }
 }
@@ -298,6 +302,82 @@ impl Snapshots for Qemu {
             _ => qmp::job(&vm.path("qmp.sock"), "snapshot-delete", json!({ "tag": name, "devices": [node_name(vm)?] })),
         }
     }
+}
+
+impl Clones for Qemu {
+    fn clone_disk(&self, from: &Vm, snap: Option<&str>, to: &Vm) -> Result<()> {
+        let source = from.path("disk.qcow2");
+        let target = to.path("disk.qcow2");
+        match self.state(from) {
+            State::Stopped => {
+                // A copy-on-write clone on APFS, btrfs and XFS: instant, and it shares the
+                // source's blocks until either changes them.
+                fs::copy(&source, &target).with_context(|| format!("copying {}", source.display()))?;
+                if let Some(snap) = snap {
+                    host::run(qemu_img()?.args(["snapshot", "-a", snap]).arg(&target))?;
+                }
+                // The copy's snapshots are the source's history, not its own.
+                let info = host::run(qemu_img()?.args(["info", "--output=json"]).arg(&target))?;
+                let info: Value = serde_json::from_str(&info).context("reading qemu-img info")?;
+                for s in snaps_from(&info["snapshots"]) {
+                    host::run(qemu_img()?.args(["snapshot", "-d", &s.name]).arg(&target))?;
+                }
+                Ok(())
+            }
+            State::Other(state) => bail!("{} is {state}", from.name),
+            _ => {
+                // QEMU is writing the disk, so copying the file could catch it mid-write. A
+                // snapshot is one consistent moment that stays put while it's read.
+                let temp = format!("vx-clone-{}", std::process::id());
+                let name = match snap {
+                    Some(snap) => snap,
+                    None => {
+                        self.save(from, &temp, false)?;
+                        &temp
+                    }
+                };
+                let copied = convert_snapshot(&source, name, &target);
+                if snap.is_none()
+                    && let Err(e) = self.delete(from, &temp)
+                {
+                    style::warn("", format!("couldn't delete the snapshot `{temp}` made for the copy: {e:#}"));
+                }
+                copied
+            }
+        }
+    }
+}
+
+/// Copy snapshot `snap` of the qcow2 at `source`, which QEMU has open, into a new qcow2 at
+/// `target`, showing how much has been copied.
+fn convert_snapshot(source: &Path, snap: &str, target: &Path) -> Result<()> {
+    let mut child = qemu_img()?
+        // -U: read while QEMU holds the disk's lock. A snapshot's clusters don't change.
+        .args(["convert", "-U", "-O", "qcow2", "-l"])
+        .arg(format!("snapshot.name={snap}"))
+        .arg(source)
+        .arg(target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running qemu-img")?;
+    let mut spinner = progress::Spinner::new();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let done = fs::metadata(target).map_or(0, |m| m.blocks() * 512);
+        spinner.update("copying the disk…", &progress::bytes(done));
+        thread::sleep(Duration::from_millis(100));
+    };
+    spinner.clear();
+    if !status.success() {
+        let mut stderr = String::new();
+        io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr)?;
+        bail!("qemu-img convert failed: {}", last_line(&stderr).unwrap_or("no error output"));
+    }
+    Ok(())
 }
 
 /// Forwards on the user-mode network (`net0` in `argv`), through the human monitor: QMP has no

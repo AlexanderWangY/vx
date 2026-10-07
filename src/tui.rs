@@ -36,7 +36,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::NewArgs;
 use crate::backend::{self, State};
-use crate::form::{AddImageForm, NewForm, NewImage, NewSnap, PortChange, PortsForm, SnapForm, Step};
+use crate::form::{AddImageForm, CloneForm, NewForm, NewImage, NewSnap, PortChange, PortsForm, SnapForm, Step};
 use crate::host::Arch;
 use crate::image::{self, Info};
 use crate::progress::bytes;
@@ -202,6 +202,7 @@ enum Verb {
     Resume,
     Delete,
     Create,
+    Clone,
     Pull,
     RemoveImage,
     AddImage,
@@ -235,6 +236,7 @@ impl Verb {
             Verb::Resume => "resuming",
             Verb::Delete | Verb::RemoveImage => "deleting",
             Verb::Create => "creating",
+            Verb::Clone => "cloning",
             Verb::Pull => "downloading",
             Verb::AddImage => "copying",
             Verb::Snapshot => "saving",
@@ -252,7 +254,7 @@ impl Verb {
             Verb::Pause => "paused",
             Verb::Resume => "resumed",
             Verb::Delete | Verb::RemoveImage => "deleted",
-            Verb::Create => "is ready",
+            Verb::Create | Verb::Clone => "is ready",
             Verb::Pull => "downloaded",
             Verb::AddImage => "added",
             Verb::Snapshot => "saved",
@@ -273,6 +275,7 @@ impl fmt::Display for Verb {
             Verb::Resume => "resume",
             Verb::Delete | Verb::RemoveImage => "delete",
             Verb::Create => "create",
+            Verb::Clone => "clone",
             Verb::Pull => "download",
             Verb::AddImage => "add",
             Verb::Snapshot => "save",
@@ -352,6 +355,7 @@ enum Modal {
     New(Box<NewForm>),
     AddImage(Box<AddImageForm>),
     Snap(Box<SnapForm>),
+    Clone(Box<CloneForm>),
     /// The ports of this VM.
     Ports(String, Box<PortsForm>),
     /// Asking before restoring the snapshot view's VM to this snapshot.
@@ -657,6 +661,25 @@ impl App {
     }
 
     /// Start `vx new` in the background; the VM shows as a row right away.
+    /// Run `vx clone` (`args`), showing the copy as a row that's being created meanwhile.
+    fn clone_vm(&mut self, args: Vec<String>) -> Action {
+        let (source, name) = (args[1].clone(), args[2].clone());
+        let from = source.split('@').next().unwrap_or_default();
+        let pending =
+            self.vms.iter().flatten().find(|e| e.name == from).and_then(|e| e.vm.as_ref().ok()).map(|(spec, _)| {
+                Pending {
+                    image: spec.image.clone(),
+                    arch: spec.arch,
+                    cpus: spec.cpus.to_string(),
+                    memory: spec.memory.clone(),
+                }
+            });
+        self.busy.insert(Target::Vm(name.clone()), Busy { verb: Verb::Clone, done: false, pending });
+        self.view = View::Vms;
+        self.follow = Some(name.clone());
+        Action::Job(Job { target: Target::Vm(name), verb: Verb::Clone, args, then: None, done: None })
+    }
+
     fn create(&mut self, args: NewArgs) -> Action {
         let name = args.name.clone().unwrap_or_default();
         let pending = Pending {
@@ -768,6 +791,11 @@ impl App {
                 Step::Cancel => {}
                 Step::Continue => self.modal = Some(Modal::Snap(form)),
             },
+            Modal::Clone(mut form) => match form.handle(key) {
+                Step::Done(args) => return self.clone_vm(args),
+                Step::Cancel => {}
+                Step::Continue => self.modal = Some(Modal::Clone(form)),
+            },
             Modal::Ports(vm, mut form) => match form.handle(key) {
                 Step::Done(PortChange::Add(host, guest)) => {
                     let args = vec!["port".into(), vm.clone(), format!("{host}:{guest}")];
@@ -844,6 +872,11 @@ impl App {
             KeyCode::Char('S') => {
                 if let Some((name, _)) = self.target() {
                     self.open_snapshots(name);
+                }
+            }
+            KeyCode::Char('C') => {
+                if let Some((name, _)) = self.target() {
+                    self.modal = Some(Modal::Clone(Box::new(CloneForm::new(&self.home, &name, None))));
                 }
             }
             KeyCode::Char('s') if ctrl => {
@@ -958,6 +991,9 @@ impl App {
             (KeyCode::Char('c'), _) => self.modal = Some(Modal::Snap(Box::new(SnapForm::new(&vm, &suggested, taken)))),
             (KeyCode::Enter, Some(name)) => self.modal = Some(Modal::Restore(name)),
             (KeyCode::Char('d'), Some(name)) => self.modal = Some(Modal::DeleteSnapshot(name)),
+            (KeyCode::Char('C'), Some(name)) => {
+                self.modal = Some(Modal::Clone(Box::new(CloneForm::new(&self.home, &vm, Some(&name)))));
+            }
             _ => {}
         }
         Action::None
@@ -1151,6 +1187,10 @@ impl App {
                 let inner = dialog(frame, area, 72, SnapForm::HEIGHT + 4, "snapshot", BORDER, 2);
                 form.render(frame, inner);
             }
+            Some(Modal::Clone(form)) => {
+                let inner = dialog(frame, area, 72, CloneForm::HEIGHT + 4, "clone", BORDER, 2);
+                form.render(frame, inner);
+            }
             Some(Modal::Ports(vm, form)) => {
                 let inner = dialog(frame, area, 72, form.height() + 4, &format!("{vm}'s ports"), BORDER, 2);
                 form.render(frame, inner);
@@ -1278,7 +1318,7 @@ impl App {
             }
             View::Snapshots => {
                 if self.snap_pick().is_some() {
-                    keys.extend([("⏎", "go back to it"), ("d", "delete")]);
+                    keys.extend([("⏎", "go back to it"), ("d", "delete"), ("C", "clone")]);
                 }
                 keys.extend([("c", "save"), ("esc", "back")]);
             }
@@ -1328,8 +1368,11 @@ impl App {
     /// What to show in place of a busy VM's state.
     fn vm_busy_label(&self, name: &str) -> Option<String> {
         let busy = self.busy.get(&Target::Vm(name.into()))?;
-        if busy.verb != Verb::Create {
-            return Some(busy.verb.doing().into());
+        let exists = self.vms.iter().flatten().any(|e| e.name == name);
+        match busy.verb {
+            Verb::Create => {}
+            Verb::Clone if exists => return Some("booting".into()),
+            verb => return Some(verb.doing().into()),
         }
         if let Some(entry) = self.vms.iter().flatten().find(|e| e.name == name) {
             return Some(if entry.setting_up { "installing" } else { "booting" }.into());
@@ -2070,6 +2113,7 @@ const HELP: [&[(&str, &str)]; 2] = [
         ("f", "forward ports"),
         ("S", "snapshots"),
         ("ctrl-s", "save a snapshot now"),
+        ("C", "clone: a new VM that's a copy"),
         ("", ""),
         ("", "images"),
         ("⏎", "new VM from it"),
@@ -2082,6 +2126,7 @@ const HELP: [&[(&str, &str)]; 2] = [
         ("c", "save one, with a name and note"),
         ("⏎", "go back to it"),
         ("d", "delete it"),
+        ("C", "new VM from it"),
         ("esc", "back to VMs"),
         ("●", "resumes running: memory saved"),
         ("○", "boots from disk: disk only"),
@@ -2682,6 +2727,36 @@ mod tests {
         typed(&mut app, "before upgrade");
         let save = job(&mut app, KeyCode::Enter).unwrap();
         assert_eq!(save.args, ["snap", "dev", "snap-1x", "-m", "before upgrade"]);
+    }
+
+    #[test]
+    fn clone_from_the_list_and_from_a_snapshot() {
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Char('C')));
+        let text = screen(&mut app, 100, 16);
+        assert!(text.contains("─ clone ─") && text.contains("Name    dev-2 ✓"), "{text}");
+        let clone = job(&mut app, KeyCode::Enter).unwrap();
+        assert_eq!(clone.args, ["clone", "dev", "dev-2"]);
+        assert_eq!(clone.target, Target::Vm("dev-2".into()));
+        let text = screen(&mut app, 100, 16);
+        assert!(text.contains("cloning     debian-13  aarch64     4      4G"), "a row for it meanwhile:\n{text}");
+
+        // A name that's taken, or not a name, isn't accepted.
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Char('C')));
+        for _ in 0.."dev-2".len() {
+            let _ = app.key(press(KeyCode::Backspace));
+        }
+        assert!(screen(&mut app, 100, 16).contains("give it a name"));
+        assert!(job(&mut app, KeyCode::Enter).is_none());
+        typed(&mut app, "Web Two");
+        assert_eq!(job(&mut app, KeyCode::Enter).unwrap().args, ["clone", "dev", "web-two"]);
+
+        let mut app = snap_view();
+        let _ = app.key(press(KeyCode::Char('g'))); // fresh
+        let _ = app.key(press(KeyCode::Char('C')));
+        assert!(screen(&mut app, 100, 16).contains("a copy of dev@fresh's disk"));
+        assert_eq!(job(&mut app, KeyCode::Enter).unwrap().args, ["clone", "dev@fresh", "dev-2"]);
     }
 
     #[test]
