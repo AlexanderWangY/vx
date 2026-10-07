@@ -4,14 +4,13 @@ The Release workflow uses the section matching each version as its GitHub Releas
 
 ## Unreleased
 
-- **Rename a VM.** `vx mv dev web` (or `vx rename`) renames it, along with its hostname and its `web.vx` SSH alias. A running VM restarts to take the new name, after asking; `-y` doesn't ask. In the dashboard, `r` renames the selected VM.
-
-- **Change a VM's CPUs, memory and disk.** `vx set dev --cpus 8 --mem 16G --disk 40G`, or `--disk +20G` for that much more; `vx set dev` shows them. A disk grows straight away, even while the VM runs, and so does its filesystem. New CPUs and memory take effect on restart, which `vx set` offers, or `--restart` does. In the dashboard, `e` changes them.
-
-- **Clones.** `vx clone dev` makes `dev-2`, a new VM with a copy of `dev`'s disk and a name, hostname, SSH port and host key of its own; `vx clone dev web` names it, and `vx clone dev@deps` copies `dev` as it was at a snapshot. A stopped VM is copied instantly; a running one keeps running. In the dashboard, `C` clones the selected VM, or the selected snapshot.
-- `vx snap` has a running VM write what it's holding in memory to its disk first, so a snapshot's disk is complete on its own, for cloning.
+## 0.4.0
 
 - **Shared folders.** `vx mount dev ~/code` makes `~/code` here show up at `~/code` in `dev`, live both ways, or `vx mount dev .:/srv/app` puts it somewhere else. `--ro` shares it read-only, `vx mount dev` lists them, `vx mount rm dev ~/code` stops sharing one, and `vx new --mount` shares one from the start. A running VM gets it straight away, and it's saved in `vx.toml` for next time. It works on every built-in distro: sshfs over vx's SSH connection, installed in the VM the first time.
+- **Clones.** `vx clone dev` makes `dev-2`, a new VM with a copy of `dev`'s disk and a name, hostname, SSH port and host key of its own; `vx clone dev web` names it, and `vx clone dev@deps` copies `dev` as it was at a snapshot. A stopped VM is copied instantly; a running one keeps running. In the dashboard, `C` clones the selected VM, or the selected snapshot.
+- **Change a VM's CPUs, memory and disk.** `vx set dev --cpus 8 --mem 16G --disk 40G`, or `--disk +20G` for that much more; `vx set dev` shows them. A disk grows straight away, even while the VM runs, and so does its filesystem. New CPUs and memory take effect on restart, which `vx set` offers, or `--restart` does. In the dashboard, `e` changes them.
+- **Rename a VM.** `vx mv dev web` (or `vx rename`) renames it, along with its hostname and its `web.vx` SSH alias. A running VM restarts to take the new name, after asking; `-y` doesn't ask. In the dashboard, `r` renames the selected VM.
+- `vx snap` has a running VM write what it's holding in memory to its disk first, so a snapshot's disk is complete on its own, for cloning.
 - `sshfs` is one of the package names `vx install` translates for each distro.
 
 ## 0.3.0
