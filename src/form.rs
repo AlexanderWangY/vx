@@ -1128,38 +1128,80 @@ impl SettingsForm {
     }
 }
 
-/// The name for a copy of a VM, or of one of its snapshots (`vx clone`).
-pub struct CloneForm {
+/// A name for a VM: for a copy of one or one of its snapshots (`vx clone`), or a new name
+/// for one (`vx mv`).
+pub struct NameForm {
     home: Home,
-    /// `dev`, or `dev@deps`.
-    source: String,
+    /// The command, up to the name.
+    args: Vec<String>,
+    /// The VM being renamed.
+    renaming: Option<String>,
+    note: String,
+    verb: &'static str,
     name: Input,
 }
 
-impl CloneForm {
+impl NameForm {
     pub const HEIGHT: u16 = 4;
 
-    pub fn new(home: &Home, vm: &str, snap: Option<&str>) -> CloneForm {
+    pub fn clone(home: &Home, vm: &str, snap: Option<&str>) -> NameForm {
         let source = match snap {
             Some(snap) => format!("{vm}@{snap}"),
             None => vm.to_string(),
         };
-        CloneForm { home: Home::at(home.root()), source, name: Input::new(&home.clone_name(vm)) }
+        NameForm {
+            home: Home::at(home.root()),
+            note: format!("a new VM with a copy of {source}'s disk, and a name of its own"),
+            args: vec!["clone".into(), source],
+            renaming: None,
+            verb: "clone",
+            name: Input::new(&home.clone_name(vm)),
+        }
+    }
+
+    /// `running` VMs restart to take the new name, which the form says before it's saved.
+    pub fn rename(home: &Home, vm: &str, running: bool) -> NameForm {
+        let note = if running {
+            format!("{vm} restarts to take its new name; its hostname changes too")
+        } else {
+            "its hostname changes too, when it next starts".into()
+        };
+        NameForm {
+            home: Home::at(home.root()),
+            args: vec!["mv".into(), "-y".into(), vm.into()],
+            renaming: Some(vm.into()),
+            note,
+            verb: if running { "rename and restart" } else { "rename" },
+            name: Input::new(vm),
+        }
+    }
+
+    pub fn title(&self) -> String {
+        match &self.renaming {
+            Some(vm) => format!("rename {vm}"),
+            None => "clone".into(),
+        }
     }
 
     fn problem(&self) -> Option<String> {
-        if self.name.text.is_empty() {
+        let name = &self.name.text;
+        if name.is_empty() {
             return Some("give it a name".into());
         }
-        self.home.check_new_name(&self.name.text).err().map(|e| e.to_string())
+        if self.renaming.as_ref() == Some(name) {
+            return Some("type its new name".into());
+        }
+        self.home.check_new_name(name).err().map(|e| e.to_string())
     }
 
-    /// The `vx clone` arguments.
+    /// The `vx` arguments.
     pub fn handle(&mut self, key: KeyEvent) -> Step<Vec<String>> {
         match key.code {
             KeyCode::Esc => return Step::Cancel,
             KeyCode::Enter if self.problem().is_none() => {
-                return Step::Done(vec!["clone".into(), self.source.clone(), self.name.text.clone()]);
+                let mut args = self.args.clone();
+                args.push(self.name.text.clone());
+                return Step::Done(args);
             }
             KeyCode::Enter => {}
             _ => self.name.edit(key, 32, |c| match c {
@@ -1177,16 +1219,15 @@ impl CloneForm {
         let skip = self.name.cursor.saturating_sub(room);
         let shown: String = self.name.text.chars().skip(skip).take(room).collect();
         let mark = if self.problem().is_none() { Span::styled(" ✓", OK) } else { Span::raw("") };
+        let renaming_running = self.verb == "rename and restart";
         let lines = vec![
             Line::from(vec![Span::styled(format!("{:LABEL$}", "Name"), ACCENT), Span::raw(shown), mark]),
             Line::default(),
             match self.problem() {
                 Some(problem) => Line::styled(problem, ERROR),
-                None => {
-                    Line::styled(format!("a new VM with a copy of {}'s disk, and a name of its own", self.source), DIM)
-                }
+                None => Line::styled(self.note.clone(), if renaming_running { WARN } else { DIM }),
             },
-            Line::styled("enter clone · esc cancel", DIM),
+            Line::styled(format!("enter {} · esc cancel", self.verb), DIM),
         ];
         frame.render_widget(Paragraph::new(lines), area);
         let cursor = Position::new(area.x + (LABEL + self.name.cursor - skip) as u16, area.y);

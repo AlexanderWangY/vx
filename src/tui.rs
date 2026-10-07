@@ -37,7 +37,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::NewArgs;
 use crate::backend::{self, State};
 use crate::form::{
-    AddImageForm, CloneForm, Limits, NewForm, NewImage, NewSnap, PortChange, PortsForm, SettingsForm, SnapForm, Step,
+    AddImageForm, Limits, NameForm, NewForm, NewImage, NewSnap, PortChange, PortsForm, SettingsForm, SnapForm, Step,
 };
 use crate::host::Arch;
 use crate::image::{self, Info};
@@ -214,6 +214,7 @@ enum Verb {
     Forward,
     Unforward,
     Set,
+    Rename,
 }
 
 impl Verb {
@@ -248,6 +249,7 @@ impl Verb {
             Verb::Forward => "forwarding",
             Verb::Unforward => "unforwarding",
             Verb::Set => "changing",
+            Verb::Rename => "renaming",
         }
     }
 
@@ -267,6 +269,7 @@ impl Verb {
             Verb::Forward => "forwarded",
             Verb::Unforward => "unforwarded",
             Verb::Set => "changed",
+            Verb::Rename => "renamed",
         }
     }
 }
@@ -289,6 +292,7 @@ impl fmt::Display for Verb {
             Verb::Forward => "forward a port to",
             Verb::Unforward => "stop forwarding a port to",
             Verb::Set => "change",
+            Verb::Rename => "rename",
         })
     }
 }
@@ -361,7 +365,8 @@ enum Modal {
     New(Box<NewForm>),
     AddImage(Box<AddImageForm>),
     Snap(Box<SnapForm>),
-    Clone(Box<CloneForm>),
+    /// Naming a clone, or a new name for a VM.
+    Name(Box<NameForm>),
     /// The CPUs, memory and disk of this VM.
     Settings(String, Box<SettingsForm>),
     /// The ports of this VM.
@@ -672,6 +677,13 @@ impl App {
     }
 
     /// Start `vx new` in the background; the VM shows as a row right away.
+    /// Run `vx mv -y <vm> <name>` (`args`), and select it under its new name once it's done.
+    fn rename(&mut self, args: Vec<String>) -> Action {
+        let (vm, name) = (args[2].clone(), args[3].clone());
+        self.follow = Some(name.clone());
+        self.vm_task(vm.clone(), Verb::Rename, args, None, format!("✓ {vm} is now {name}"))
+    }
+
     /// Run `vx clone` (`args`), showing the copy as a row that's being created meanwhile.
     fn clone_vm(&mut self, args: Vec<String>) -> Action {
         let (source, name) = (args[1].clone(), args[2].clone());
@@ -816,10 +828,11 @@ impl App {
                 Step::Cancel => {}
                 Step::Continue => self.modal = Some(Modal::Settings(vm, form)),
             },
-            Modal::Clone(mut form) => match form.handle(key) {
-                Step::Done(args) => return self.clone_vm(args),
+            Modal::Name(mut form) => match form.handle(key) {
+                Step::Done(args) if args[0] == "clone" => return self.clone_vm(args),
+                Step::Done(args) => return self.rename(args),
                 Step::Cancel => {}
-                Step::Continue => self.modal = Some(Modal::Clone(form)),
+                Step::Continue => self.modal = Some(Modal::Name(form)),
             },
             Modal::Ports(vm, mut form) => match form.handle(key) {
                 Step::Done(PortChange::Add(host, guest)) => {
@@ -911,9 +924,15 @@ impl App {
                     self.modal = Some(Modal::Settings(name, Box::new(form)));
                 }
             }
+            KeyCode::Char('r') => {
+                if let Some((name, state)) = self.target() {
+                    let form = NameForm::rename(&self.home, &name, state != State::Stopped);
+                    self.modal = Some(Modal::Name(Box::new(form)));
+                }
+            }
             KeyCode::Char('C') => {
                 if let Some((name, _)) = self.target() {
-                    self.modal = Some(Modal::Clone(Box::new(CloneForm::new(&self.home, &name, None))));
+                    self.modal = Some(Modal::Name(Box::new(NameForm::clone(&self.home, &name, None))));
                 }
             }
             KeyCode::Char('s') if ctrl => {
@@ -1029,7 +1048,7 @@ impl App {
             (KeyCode::Enter, Some(name)) => self.modal = Some(Modal::Restore(name)),
             (KeyCode::Char('d'), Some(name)) => self.modal = Some(Modal::DeleteSnapshot(name)),
             (KeyCode::Char('C'), Some(name)) => {
-                self.modal = Some(Modal::Clone(Box::new(CloneForm::new(&self.home, &vm, Some(&name)))));
+                self.modal = Some(Modal::Name(Box::new(NameForm::clone(&self.home, &vm, Some(&name)))));
             }
             _ => {}
         }
@@ -1228,8 +1247,8 @@ impl App {
                 let inner = dialog(frame, area, 72, SettingsForm::HEIGHT + 4, &format!("{vm}'s settings"), BORDER, 2);
                 form.render(frame, inner);
             }
-            Some(Modal::Clone(form)) => {
-                let inner = dialog(frame, area, 72, CloneForm::HEIGHT + 4, "clone", BORDER, 2);
+            Some(Modal::Name(form)) => {
+                let inner = dialog(frame, area, 72, NameForm::HEIGHT + 4, &form.title(), BORDER, 2);
                 form.render(frame, inner);
             }
             Some(Modal::Ports(vm, form)) => {
@@ -2154,14 +2173,12 @@ const HELP: [&[(&str, &str)]; 2] = [
         ("f", "forward ports"),
         ("S", "snapshots"),
         ("ctrl-s", "save a snapshot now"),
-        ("e", "CPUs, memory and disk"),
+        ("e r", "CPUs, memory, disk · rename"),
         ("C", "clone: a new VM that's a copy"),
         ("", ""),
-        ("", "images"),
-        ("⏎", "new VM from it"),
-        ("p", "download it now"),
-        ("a", "add a disk image of your own"),
-        ("d", "delete its copy"),
+        ("tab", "switch between VMs and images"),
+        ("↑↓ j k", "select · g G first / last"),
+        ("q", "quit"),
     ],
     &[
         ("", "snapshots"),
@@ -2174,9 +2191,11 @@ const HELP: [&[(&str, &str)]; 2] = [
         ("○", "boots from disk: disk only"),
         ("cyan", "the current snapshot"),
         ("", ""),
-        ("tab", "switch between VMs and images"),
-        ("↑↓ j k", "select · g G first / last"),
-        ("q", "quit"),
+        ("", "images"),
+        ("⏎", "new VM from it"),
+        ("p", "download it now"),
+        ("a", "add a disk image of your own"),
+        ("d", "delete its copy"),
     ],
 ];
 
@@ -2810,6 +2829,41 @@ mod tests {
         let _ = app.key(press(KeyCode::Char('e')));
         assert_eq!(app.key(press(KeyCode::Enter)), Action::None);
         assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn rename_dialog_runs_vx_mv() {
+        // dev runs, so the dialog says it restarts before it's saved.
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Char('r')));
+        let text = screen(&mut app, 100, 16);
+        assert!(text.contains("─ rename dev ─") && text.contains("type its new name"), "{text}");
+        assert!(job(&mut app, KeyCode::Enter).is_none(), "the same name isn't a rename");
+        for _ in 0.."dev".len() {
+            let _ = app.key(press(KeyCode::Backspace));
+        }
+        typed(&mut app, "wex");
+        let text = screen(&mut app, 100, 16);
+        assert!(
+            text.contains("dev restarts to take its new name") && text.contains("enter rename and restart"),
+            "{text}"
+        );
+        let mv = job(&mut app, KeyCode::Enter).unwrap();
+        assert_eq!(mv.args, ["mv", "-y", "dev", "wex"]);
+        assert_eq!(mv.done.as_deref(), Some("✓ dev is now wex"));
+        assert_eq!(app.follow.as_deref(), Some("wex"), "selected under its new name once it's done");
+
+        // web is stopped: nothing restarts.
+        let mut app = with_vms();
+        let _ = app.key(press(KeyCode::Down));
+        let _ = app.key(press(KeyCode::Char('r')));
+        typed(&mut app, "2");
+        let text = screen(&mut app, 100, 16);
+        assert!(
+            text.contains("hostname changes too, when it next starts") && text.contains("enter rename ·"),
+            "{text}"
+        );
+        assert_eq!(job(&mut app, KeyCode::Enter).unwrap().args, ["mv", "-y", "web", "web2"]);
     }
 
     #[test]
