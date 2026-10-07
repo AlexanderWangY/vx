@@ -49,6 +49,7 @@ vx start | stop | pause | resume <vm>
 vx ssh <vm> [-- cmd]            # starts it first if needed
 vx cp <path>... <vm>:<path>     # copy in; or <vm>:<path>... <path> to copy out
 vx port <vm> [8080:80 | 3000]   # forward ports to it, or list them; vx port rm <vm> 8080
+vx mount <vm> [~/code]          # share a folder with it, or list them; see "Shared folders" below
 vx console <vm>                 # serial console, Ctrl-] to detach
 vx logs -f <vm>
 vx snap <vm> [name]             # see Snapshots below
@@ -68,12 +69,31 @@ install = ["git", "build-tools", "python", "tmux"]
 setup = "~/.vx/setup.sh"     # optional: a script of yours, run in the VM as you
 ```
 
-`vx new` installs the packages once the VM is up, then runs the script, showing progress as it goes. Package names are the distro's own, except a few that differ between distros, which work everywhere: `build-tools`, `python`, `node`, `go`, `rust` and `fd`. On Rocky, Alma and CentOS, EPEL is turned on when a package needs it.
+`vx new` installs the packages once the VM is up, then runs the script, showing progress as it goes. Package names are the distro's own, except a few that differ between distros, which work everywhere: `build-tools`, `python`, `node`, `go`, `rust`, `fd` and `sshfs`. On Rocky, Alma and CentOS, EPEL is turned on when a package needs it.
 
 - `vx new dev --install htop,jq` adds to the defaults for one VM; `--bare` skips them; `--setup ./other.sh` runs a different script.
 - `vx install dev ripgrep` installs into a VM you already have.
 - In the dashboard, the new-VM form shows the defaults, ready to change for that VM.
 - Everything they print goes to `~/.vx/vms/<vm>/setup.log`.
+
+## Shared folders
+
+Edit on your machine, build in the VM:
+
+```
+vx mount dev ~/code             # ~/code here is ~/code in dev, live both ways
+vx mount dev .:/srv/app         # this folder, at /srv/app in dev
+vx mount dev ~/notes --ro       # dev can read it but not change it
+vx mount dev                    # list them
+vx mount rm dev ~/code          # stop sharing it
+vx new dev --mount ~/code       # or share it from the start
+```
+
+A folder in your home goes to the same place in the VM's home; one outside it keeps its path. A running VM gets it straight away, and it comes back every time the VM starts. Files you create in the VM are yours on this machine, and yours in the VM.
+
+It works on every built-in distro and needs nothing set up on either side: the VM mounts the folder with sshfs over vx's own SSH connection, served by this machine's `sftp-server`, so nothing new listens on your network. The first mount installs sshfs in the VM. It's quick for editing and building, though slower than the VM's own disk for heavy I/O, like a large `node_modules`.
+
+One thing to know: `sftp-server` runs as you, and root in the VM could use the connection to reach any file you can, not only the shared folder. Share folders with VMs you'd trust with your own shell.
 
 ## Snapshots
 

@@ -169,6 +169,7 @@ const ALIASES: &[(&[&str], [&[&str]; 4])] = &[
     (&["go", "golang"], [&["golang"], &["golang"], &["go"], &["go"]]),
     (&["rust"], [&["rustc", "cargo"], &["rust", "cargo"], &["rust", "cargo"], &["rust"]]),
     (&["fd", "fd-find"], [&["fd-find"], &["fd-find"], &["fd"], &["fd"]]),
+    (&["sshfs", "fuse-sshfs"], [&["sshfs"], &["fuse-sshfs"], &["sshfs"], &["sshfs"]]),
 ];
 
 /// The packages to ask `family` for.
@@ -191,9 +192,15 @@ fn translate(packages: &[String], family: Family) -> Vec<String> {
 }
 
 /// A POSIX shell script, run as root, that installs `packages` with whichever package manager
-/// the VM has. Lines starting `vx:` are progress for the spinner.
-pub fn script(packages: &[String]) -> String {
+/// the VM has. Lines starting `vx:` are progress for the spinner. `lean` leaves out what they
+/// only recommend: sshfs on Fedora would otherwise bring a desktop's worth of GTK with it.
+pub fn script(packages: &[String], lean: bool) -> String {
     let list = |family| translate(packages, family).join(" ");
+    let (apt_lean, dnf_lean, zypper_lean) = if lean {
+        (" --no-install-recommends", " --setopt=install_weak_deps=False", " --no-recommends")
+    } else {
+        ("", "", "")
+    };
     format!(
         r#"set -e
 has() {{ command -v "$1" >/dev/null 2>&1; }}
@@ -204,20 +211,20 @@ if has apt-get; then
   echo "vx: updating package lists"
   $apt update
   echo "vx: installing {apt}"
-  $apt install -y {apt}
+  $apt install -y{apt_lean} {apt}
 elif has dnf; then
   echo "vx: installing {dnf}"
-  if ! dnf install -y {dnf}; then
+  if ! dnf install -y{dnf_lean} {dnf}; then
     # Rocky, Alma and CentOS keep many everyday tools in EPEL.
     . /etc/os-release
     case " $ID $ID_LIKE " in
-      *" rhel "*) echo "vx: trying again with EPEL"; dnf install -y epel-release; dnf install -y {dnf} ;;
+      *" rhel "*) echo "vx: trying again with EPEL"; dnf install -y epel-release; dnf install -y{dnf_lean} {dnf} ;;
       *) exit 1 ;;
     esac
   fi
 elif has zypper; then
   echo "vx: installing {zypper}"
-  zypper --non-interactive install {zypper}
+  zypper --non-interactive install{zypper_lean} {zypper}
 elif has pacman; then
   echo "vx: installing {pacman}"
   pacman -Syu --noconfirm --needed {pacman}
@@ -240,7 +247,7 @@ pub fn install(config: &Path, vm: &Vm, packages: &[String]) -> Result<()> {
     }
     let what = packages.join(", ");
     let started = Instant::now();
-    run(config, vm, "sudo -n sh -s", script(packages).as_bytes(), &format!("installing {what}…"))
+    run(config, vm, "sudo -n sh -s", script(packages, false).as_bytes(), &format!("installing {what}…"))
         .map_err(|why| failed(vm, &format!("couldn't install {what} in {}", vm.name), why))?;
     done(&format!("installed {what}"), started);
     Ok(())
@@ -380,11 +387,19 @@ mod tests {
 
     #[test]
     fn the_script_has_a_list_per_package_manager() {
-        let script = script(&strings(&["git", "build-tools"]));
+        let script = script(&strings(&["git", "build-tools"]), false);
         assert!(script.contains("$apt install -y git build-essential"), "{script}");
         assert!(script.contains("dnf install -y git gcc gcc-c++ make"), "{script}");
         assert!(script.contains("zypper --non-interactive install git gcc gcc-c++ make"), "{script}");
         assert!(script.contains("pacman -Syu --noconfirm --needed git base-devel"), "{script}");
+    }
+
+    #[test]
+    fn a_lean_script_skips_recommends() {
+        let script = script(&strings(&["sshfs"]), true);
+        assert!(script.contains("$apt install -y --no-install-recommends sshfs"), "{script}");
+        assert!(script.contains("dnf install -y --setopt=install_weak_deps=False fuse-sshfs"), "{script}");
+        assert!(script.contains("zypper --non-interactive install --no-recommends sshfs"), "{script}");
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod form;
 #[allow(dead_code)]
 mod host;
 mod image;
+mod mount;
 mod ports;
 mod progress;
 #[allow(dead_code)]
@@ -112,6 +113,18 @@ enum Command {
     ///   vx port rm dev 8080      stop forwarding it
     #[command(verbatim_doc_comment)]
     Port(PortArgs),
+    /// Share a folder on this machine with a VM, or list them
+    ///
+    ///   vx mount dev                  list them
+    ///   vx mount dev ~/code           ~/code here is ~/code in dev too
+    ///   vx mount dev .:/srv/app       this folder is /srv/app in dev
+    ///   vx mount dev ~/notes --ro     dev can read it but not change it
+    ///   vx mount rm dev ~/code        stop sharing it
+    #[command(verbatim_doc_comment)]
+    Mount(MountArgs),
+    /// Keeps a running VM's mounts up; started by vx itself
+    #[command(hide = true)]
+    MountAgent { vm: String },
     /// Save a VM as it is now, to go back to later (`vx snap ls` shows them)
     Snap(SnapArgs),
     /// List the images `vx new` can use, or manage them
@@ -140,6 +153,31 @@ enum PortCommand {
         vm: String,
         #[arg(required = true)]
         ports: Vec<u16>,
+    },
+}
+
+#[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct MountArgs {
+    #[command(subcommand)]
+    action: Option<MountCommand>,
+    /// The VM (leave it out to pick one)
+    vm: Option<String>,
+    /// Folders to share, as <folder here>[:<place in the VM>]; none lists them
+    #[arg(value_name = "FOLDERS")]
+    folders: Vec<String>,
+    /// Let the VM read them but not change them
+    #[arg(long)]
+    ro: bool,
+}
+
+#[derive(Subcommand)]
+enum MountCommand {
+    /// Stop sharing folders, by their path here or in the VM
+    Rm {
+        vm: String,
+        #[arg(required = true, value_name = "FOLDERS")]
+        folders: Vec<String>,
     },
 }
 
@@ -230,6 +268,9 @@ struct NewArgs {
     /// Skip the defaults in ~/.vx/config.toml
     #[arg(long)]
     bare: bool,
+    /// Share a folder on this machine with it, as <folder>[:<place in the VM>]; repeatable
+    #[arg(long, value_name = "FOLDER")]
+    mount: Vec<String>,
 }
 
 fn size(s: &str) -> Result<String, String> {
@@ -339,6 +380,21 @@ fn run(cli: Cli) -> Result<()> {
         Command::Port(PortArgs { action: Some(PortCommand::Rm { vm, ports }), .. }) => {
             ports::remove(&mut home.load(&vm)?, &ports)?;
         }
+        Command::Mount(MountArgs { action: None, vm, folders, ro }) => {
+            if let Some(mut vm) = pick(vm, "mount", "Which VM's folders?", None)? {
+                if folders.is_empty() {
+                    mount::list(&vm)?;
+                } else {
+                    mount::check_host()?;
+                    let mounts = folders.iter().map(|f| mount::parse(f, ro)).collect::<Result<Vec<_>>>()?;
+                    mount::add(&home, &mut vm, mounts)?;
+                }
+            }
+        }
+        Command::Mount(MountArgs { action: Some(MountCommand::Rm { vm, folders }), .. }) => {
+            mount::remove(&mut home.load(&vm)?, &folders)?;
+        }
+        Command::MountAgent { vm } => mount::agent(&home, &vm)?,
         Command::Snap(SnapArgs { action: None, vm, name, message }) => {
             if let Some(vm) = pick(vm, "snap", "Which VM do you want to snapshot?", None)? {
                 snap(&home, &vm, name, message.unwrap_or_default())?;
@@ -474,6 +530,7 @@ fn rm(vm: Vm, yes: bool) -> Result<()> {
     if backend.state(&vm) != State::Stopped {
         backend.stop(&vm, true)?;
     }
+    mount::stop_agent(&vm);
     let name = vm.name.clone();
     vm.delete()?;
     println!("{} {name} deleted {}", OUT.green('✓'), OUT.dim("· cached images are kept"));
@@ -665,6 +722,10 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
     let defaults = setup::Config::load(home)?;
     let plan = setup::Plan::new(&defaults.new, args.bare, &args.install, args.setup.as_deref());
     plan.check()?;
+    let mounts = args.mount.iter().map(|m| mount::parse(m, false)).collect::<Result<Vec<_>>>()?;
+    if !mounts.is_empty() {
+        mount::check_host()?;
+    }
 
     // Check the tools exist before spending minutes on a download.
     let backend = backend::get(&spec.backend)?;
@@ -694,6 +755,10 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
     eprintln!("  {check} disk  {check} keys  {check} cloud-init  {check} ssh port {}", vm.spec.ssh.port);
 
     if args.no_start {
+        // Nothing runs yet, so they can go straight in; they're mounted when it starts.
+        let mut vm = vm;
+        vm.spec.mounts = mounts;
+        vm.save()?;
         let tip = format!("· start it with `vx start {}`", vm.name);
         eprintln!("  {check} {} created {}", ERR.bold(&vm.name), ERR.dim(tip));
         if !plan.install.is_empty() {
@@ -711,6 +776,23 @@ fn new(home: &Home, args: NewArgs) -> Result<()> {
     if !plan.install.is_empty() {
         setup::install(&config, &vm, &plan.install)?;
     }
+    // After the packages, so the mount agent's own install of sshfs doesn't wait on theirs.
+    let vm = if mounts.is_empty() {
+        vm
+    } else {
+        let mut vm = vm;
+        vm.spec.mounts = mounts;
+        vm.save()?;
+        mount::ensure_agent(&vm)?;
+        let failed = mount::wait(&vm, |_| true, Duration::from_secs(60));
+        let ok: Vec<&str> =
+            vm.spec.mounts.iter().filter(|m| !failed.iter().any(|(f, _)| f == *m)).map(|m| m.guest.as_str()).collect();
+        if !ok.is_empty() {
+            eprintln!("  {} mounted {}", ERR.green('✓'), ok.join(", "));
+        }
+        mount::report(&vm, &failed);
+        vm
+    };
     if let Some(script) = &plan.setup {
         setup::run_script(&config, &vm, script)?;
     }
@@ -760,6 +842,11 @@ fn reachable(home: &Home, vm: &Vm) -> Result<PathBuf> {
             return Err(hinted(format!("{} is paused", vm.name), format!("vx resume {}", vm.name)));
         }
         _ => {}
+    }
+    // So a shared folder is there to use as soon as you're in.
+    if !vm.spec.mounts.is_empty() {
+        mount::ensure_agent(vm)?;
+        mount::report(vm, &mount::wait(vm, |_| true, Duration::from_secs(30)));
     }
     Ok(config)
 }

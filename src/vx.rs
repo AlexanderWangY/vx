@@ -246,6 +246,9 @@ pub struct Spec {
     /// Extra TCP forwards on 127.0.0.1, as "host:guest".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward: Vec<String>,
+    /// Folders on this machine shared with the VM (`vx mount`).
+    #[serde(default, rename = "mount", skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<Mount>,
     pub ssh: SshSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qemu: Option<QemuSpec>,
@@ -256,6 +259,18 @@ pub struct Spec {
 pub struct SshSpec {
     pub user: String,
     pub port: u16,
+}
+
+/// A folder on this machine that shows up inside the VM.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mount {
+    /// An absolute path on this machine.
+    pub host: PathBuf,
+    /// Where it appears in the VM: absolute, or `~/…` for the VM user's home.
+    pub guest: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 /// QEMU's escape hatch.
@@ -277,6 +292,7 @@ impl Spec {
             cpus: std::thread::available_parallelism().map_or(4, |n| n.get().min(4) as u32),
             memory: "4G".into(),
             forward: vec![],
+            mounts: vec![],
             ssh: SshSpec { user: guest_user(&env::var("USER").unwrap_or_default()), port: FIRST_SSH_PORT },
             qemu: None,
         })
@@ -301,6 +317,12 @@ impl Spec {
         for f in &self.forward {
             let (host, _) = parse_forward(f)?;
             ensure!(hosts.insert(host), "host port {host} is used more than once");
+        }
+        let mut guests = HashSet::new();
+        for m in &self.mounts {
+            ensure!(m.host.is_absolute(), "mount host `{}` should be an absolute path", m.host.display());
+            crate::mount::check_guest(&m.guest)?;
+            ensure!(guests.insert(&m.guest), "mount guest `{}` is used more than once", m.guest);
         }
         Ok(())
     }
