@@ -398,6 +398,31 @@ pub fn is_size(s: &str) -> bool {
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && digits.bytes().any(|b| b != b'0')
 }
 
+/// The bytes in a size `is_size` accepts: binary units, and MiB when there's none.
+pub fn size_bytes(s: &str) -> Option<u64> {
+    if !is_size(s) {
+        return None;
+    }
+    let (digits, shift) = match s.as_bytes()[s.len() - 1].to_ascii_uppercase() {
+        b'K' => (&s[..s.len() - 1], 10),
+        b'M' => (&s[..s.len() - 1], 20),
+        b'G' => (&s[..s.len() - 1], 30),
+        b'T' => (&s[..s.len() - 1], 40),
+        _ => (s, 20),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
+}
+
+/// `bytes` the way sizes are written here: 40G, 1536M.
+pub fn show_size(bytes: u64) -> String {
+    for (unit, shift) in [("T", 40), ("G", 30), ("M", 20)] {
+        if bytes >= 1 << shift && bytes.is_multiple_of(1 << shift) {
+            return format!("{}{unit}", bytes >> shift);
+        }
+    }
+    format!("{}K", bytes.div_ceil(1 << 10))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +544,19 @@ mod tests {
         for bad in ["", "G", "0", "0G", "4GB", "-4G", "4.5G", " 4G"] {
             assert!(!is_size(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn size_conversions() {
+        assert_eq!(size_bytes("4G"), Some(4 << 30));
+        assert_eq!(size_bytes("512m"), Some(512 << 20));
+        assert_eq!(size_bytes("4096"), Some(4096 << 20), "MiB without a unit, like -m");
+        assert_eq!(size_bytes("1T"), Some(1 << 40));
+        assert_eq!(size_bytes("4GB"), None);
+        assert_eq!(show_size(40 << 30), "40G");
+        assert_eq!(show_size(1536 << 20), "1536M");
+        assert_eq!(show_size(2 << 40), "2T");
+        assert_eq!(show_size(size_bytes("4096").unwrap()), "4G");
     }
 
     #[test]

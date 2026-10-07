@@ -50,6 +50,11 @@ pub trait Backend: Sync {
     fn disk_usage(&self, _vm: &Vm) -> Option<u64> {
         None
     }
+    /// What a running VM has right now, as (CPUs, bytes of memory), which can differ from
+    /// vx.toml until it restarts.
+    fn running_size(&self, _vm: &Vm) -> Option<(u32, u64)> {
+        None
+    }
     /// Host checks for `vx doctor`.
     fn checks(&self) -> Vec<Check> {
         vec![]
@@ -72,6 +77,9 @@ pub trait Backend: Sync {
         None
     }
     fn clones(&self) -> Option<&dyn Clones> {
+        None
+    }
+    fn disks(&self) -> Option<&dyn Disks> {
         None
     }
 }
@@ -122,6 +130,14 @@ pub trait Clones {
     /// Make `to`'s disk a copy of `from`'s, as it is now or, with `snap`, as it was at that
     /// snapshot. The copy has none of `from`'s snapshots. A running `from` keeps running.
     fn clone_disk(&self, from: &Vm, snap: Option<&str>, to: &Vm) -> Result<()>;
+}
+
+/// Growing a VM's disk (`vx set --disk`).
+pub trait Disks {
+    /// How big the disk is, as the VM sees it, in bytes.
+    fn disk_size(&self, vm: &Vm) -> Result<u64>;
+    /// Make the disk `bytes` big. It only grows; a running VM sees the new size straight away.
+    fn grow_disk(&self, vm: &Vm, bytes: u64) -> Result<()>;
 }
 
 /// The exact command line a VM runs with (`vx cmd`).

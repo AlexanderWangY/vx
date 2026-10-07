@@ -20,6 +20,7 @@ use crate::host::Arch;
 use crate::image::{self, Source};
 use crate::ports;
 use crate::progress::bytes;
+use crate::set;
 use crate::setup;
 use crate::snapshot;
 use crate::style::{self, OUT};
@@ -972,6 +973,154 @@ impl SnapForm {
             None => Line::styled("a running VM's memory is saved too, so it resumes right where it was", DIM),
         });
         lines.push(Line::styled("tab move · enter save · esc cancel", DIM));
+        frame.render_widget(Paragraph::new(lines), area);
+        if let Some(position) = cursor.filter(|p| area.contains(*p)) {
+            frame.set_cursor_position(position);
+        }
+    }
+}
+
+/// How much this machine can give a VM, which the settings form holds it to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limits {
+    pub cpus: u32,
+    /// Bytes, when known.
+    pub memory: Option<u64>,
+}
+
+impl Limits {
+    pub fn host() -> Limits {
+        Limits { cpus: set::max_cpus(), memory: crate::host::memory() }
+    }
+}
+
+/// A VM's CPUs, memory and disk (`vx set`).
+pub struct SettingsForm {
+    vm: String,
+    running: bool,
+    limits: Limits,
+    cpus: u32,
+    memory: String,
+    disk: u64,
+    /// 0: CPUs, 1: memory, 2: disk.
+    focus: usize,
+    inputs: [Input; 3],
+}
+
+impl SettingsForm {
+    pub const HEIGHT: u16 = 6;
+
+    /// `disk` is its size now, in bytes, if that's known. Left empty, the disk stays as it is.
+    pub fn new(vm: &str, spec: &Spec, running: bool, disk: Option<u64>, limits: Limits) -> SettingsForm {
+        let inputs = [
+            Input::new(&spec.cpus.to_string()),
+            Input::new(&spec.memory),
+            Input::new(&disk.map(vx::show_size).unwrap_or_default()),
+        ];
+        let disk = disk.unwrap_or_default();
+        let memory = spec.memory.clone();
+        SettingsForm { vm: vm.into(), running, limits, cpus: spec.cpus, memory, disk, focus: 0, inputs }
+    }
+
+    fn problem(&self) -> Option<(usize, String)> {
+        let [cpus, memory, disk] = &self.inputs;
+        let max = self.limits.cpus;
+        if !cpus.text.parse::<u32>().is_ok_and(|c| (1..=max).contains(&c)) {
+            return Some((0, format!("1 to {max} CPUs, as many as this machine has")));
+        }
+        match vx::size_bytes(&memory.text) {
+            None => return Some((1, "memory like 4G or 512M".into())),
+            Some(m) if self.limits.memory.is_some_and(|host| m > host) => {
+                return Some((1, "more memory than this machine has".into()));
+            }
+            Some(_) => {}
+        }
+        match set::disk_target(self.disk, &disk.text) {
+            None if disk.text.is_empty() => None,
+            None => Some((2, "disk like 40G, or +20G for that much more".into())),
+            Some(d) if d < self.disk => Some((2, format!("disks only grow; it's {} now", vx::show_size(self.disk)))),
+            Some(_) => None,
+        }
+    }
+
+    /// Whether what's typed changes CPUs or memory, which a running VM restarts for.
+    fn restarts(&self) -> bool {
+        let [cpus, memory, _] = &self.inputs;
+        self.running
+            && (cpus.text != self.cpus.to_string() || vx::size_bytes(&memory.text) != vx::size_bytes(&self.memory))
+    }
+
+    /// The `vx set` arguments for what changed; just `set <vm>` when nothing did.
+    pub fn handle(&mut self, key: KeyEvent) -> Step<Vec<String>> {
+        match key.code {
+            KeyCode::Esc => return Step::Cancel,
+            KeyCode::Tab | KeyCode::Down => self.focus = (self.focus + 1) % 3,
+            KeyCode::BackTab | KeyCode::Up => self.focus = (self.focus + 2) % 3,
+            KeyCode::Enter => match self.problem() {
+                Some((field, _)) => self.focus = field,
+                None => return Step::Done(self.args()),
+            },
+            _ => {
+                let focus = self.focus;
+                self.inputs[focus].edit(key, 8, |c| match c {
+                    '0'..='9' => Some(c),
+                    'k' | 'm' | 'g' | 't' if focus > 0 => Some(c.to_ascii_uppercase()),
+                    'K' | 'M' | 'G' | 'T' | '+' if focus > 0 => Some(c),
+                    _ => None,
+                });
+            }
+        }
+        Step::Continue
+    }
+
+    fn args(&self) -> Vec<String> {
+        let [cpus, memory, disk] = &self.inputs;
+        let mut args = vec!["set".to_string(), self.vm.clone()];
+        if cpus.text != self.cpus.to_string() {
+            args.extend(["--cpus".into(), cpus.text.clone()]);
+        }
+        if vx::size_bytes(&memory.text) != vx::size_bytes(&self.memory) {
+            args.extend(["--mem".into(), memory.text.clone()]);
+        }
+        if !disk.text.is_empty() && set::disk_target(self.disk, &disk.text) != Some(self.disk) {
+            args.extend(["--disk".into(), disk.text.clone()]);
+        }
+        if self.restarts() {
+            args.push("--restart".into());
+        }
+        args
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let problem = self.problem();
+        let mut lines = Vec::new();
+        let mut cursor = None;
+        for (i, title) in ["CPUs", "Memory", "Disk"].into_iter().enumerate() {
+            let input = &self.inputs[i];
+            let label = if self.focus == i { ACCENT } else { Style::new() };
+            if self.focus == i {
+                cursor = Some(Position::new(area.x + (LABEL + input.cursor) as u16, area.y + i as u16));
+            }
+            let mark = match &problem {
+                Some((field, _)) if *field == i => Span::styled(" ✗", ERROR),
+                _ => Span::styled(" ✓", OK),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{title:LABEL$}"), label),
+                Span::raw(input.text.clone()),
+                mark,
+            ]));
+        }
+        lines.push(Line::default());
+        lines.push(match &problem {
+            Some((_, why)) => Line::styled(why.clone(), ERROR),
+            None if self.restarts() => {
+                Line::styled(format!("{} restarts so its CPUs and memory change", self.vm), WARN)
+            }
+            None => Line::styled("a disk grows straight away, even while it runs", DIM),
+        });
+        let enter = if self.restarts() { "enter save and restart" } else { "enter save" };
+        lines.push(Line::styled(format!("tab move · {enter} · esc cancel"), DIM));
         frame.render_widget(Paragraph::new(lines), area);
         if let Some(position) = cursor.filter(|p| area.contains(*p)) {
             frame.set_cursor_position(position);
