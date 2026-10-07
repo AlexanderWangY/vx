@@ -124,6 +124,17 @@ pub fn reachable(config: &Path, vm: &Vm) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Have the guest write what it's holding in memory to its disk, so a copy or snapshot of the
+/// disk alone has it. Best effort: a VM that doesn't answer is left as it is.
+pub fn sync(config: &Path, vm: &Vm) {
+    let _ = ssh(config, vm)
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "sync"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Replace this process with `scp`, which copies `operands` (sources, then a destination) using
 /// the VM's ssh_config. `-r` lets any of them be a directory.
 pub fn copy(config: &Path, operands: &[String]) -> Result<()> {

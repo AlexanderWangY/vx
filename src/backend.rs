@@ -71,6 +71,9 @@ pub trait Backend: Sync {
     fn forwards(&self) -> Option<&dyn Forwards> {
         None
     }
+    fn clones(&self) -> Option<&dyn Clones> {
+        None
+    }
 }
 
 pub trait Pause {
@@ -112,6 +115,13 @@ pub trait Forwards {
     fn remove(&self, vm: &Vm, host: u16) -> Result<()>;
     /// What the running VM forwards, as (host, guest), SSH included.
     fn active(&self, vm: &Vm) -> Result<Vec<(u16, u16)>>;
+}
+
+/// Copying a VM's disk for `vx clone`.
+pub trait Clones {
+    /// Make `to`'s disk a copy of `from`'s, as it is now or, with `snap`, as it was at that
+    /// snapshot. The copy has none of `from`'s snapshots. A running `from` keeps running.
+    fn clone_disk(&self, from: &Vm, snap: Option<&str>, to: &Vm) -> Result<()>;
 }
 
 /// The exact command line a VM runs with (`vx cmd`).

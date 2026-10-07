@@ -53,6 +53,7 @@ vx mount <vm> [~/code]          # share a folder with it, or list them; see "Sha
 vx console <vm>                 # serial console, Ctrl-] to detach
 vx logs -f <vm>
 vx snap <vm> [name]             # see Snapshots below
+vx clone <vm>[@snapshot] [name] # a new VM that's a copy; see Clones below
 vx rm <vm>
 ```
 
@@ -116,6 +117,22 @@ k8s         5h ago  547 MB memory  from deps · kind cluster up
 The current snapshot, the one the VM's state is based on, is highlighted. `from deps` appears only after going back: when a snapshot wasn't saved right after the one above it.
 
 In the dashboard, `S` opens the selected VM's snapshots and `ctrl-s` saves one right away. Snapshots live inside the VM's disk, so `vx rm` takes them with it.
+
+## Clones
+
+Set a VM up once, then make as many as you like:
+
+```
+vx clone dev                    # dev-2, a copy of dev as it is now
+vx clone dev web                # named web
+vx clone dev@deps try-nix       # dev as it was at snapshot deps
+```
+
+A clone starts with everything on the original's disk, as a machine of its own: its own name and hostname, SSH port and host key. The original's snapshots and forwarded ports stay with it; shared folders come along.
+
+The original can keep running. A stopped one is copied instantly, sharing disk space until either changes. A running one keeps running, and the clone gets its disk as it is at that moment. Cloning a snapshot copies its disk, so the clone boots fresh even if the snapshot saved memory too.
+
+In the dashboard, `C` clones the selected VM, or the selected snapshot on the snapshots screen.
 
 ## Images
 

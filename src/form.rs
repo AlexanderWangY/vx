@@ -979,6 +979,74 @@ impl SnapForm {
     }
 }
 
+/// The name for a copy of a VM, or of one of its snapshots (`vx clone`).
+pub struct CloneForm {
+    home: Home,
+    /// `dev`, or `dev@deps`.
+    source: String,
+    name: Input,
+}
+
+impl CloneForm {
+    pub const HEIGHT: u16 = 4;
+
+    pub fn new(home: &Home, vm: &str, snap: Option<&str>) -> CloneForm {
+        let source = match snap {
+            Some(snap) => format!("{vm}@{snap}"),
+            None => vm.to_string(),
+        };
+        CloneForm { home: Home::at(home.root()), source, name: Input::new(&home.clone_name(vm)) }
+    }
+
+    fn problem(&self) -> Option<String> {
+        if self.name.text.is_empty() {
+            return Some("give it a name".into());
+        }
+        self.home.check_new_name(&self.name.text).err().map(|e| e.to_string())
+    }
+
+    /// The `vx clone` arguments.
+    pub fn handle(&mut self, key: KeyEvent) -> Step<Vec<String>> {
+        match key.code {
+            KeyCode::Esc => return Step::Cancel,
+            KeyCode::Enter if self.problem().is_none() => {
+                return Step::Done(vec!["clone".into(), self.source.clone(), self.name.text.clone()]);
+            }
+            KeyCode::Enter => {}
+            _ => self.name.edit(key, 32, |c| match c {
+                'a'..='z' | '0'..='9' | '-' => Some(c),
+                'A'..='Z' => Some(c.to_ascii_lowercase()),
+                ' ' | '_' => Some('-'),
+                _ => None,
+            }),
+        }
+        Step::Continue
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        let room = (area.width as usize).saturating_sub(LABEL + 3).max(1);
+        let skip = self.name.cursor.saturating_sub(room);
+        let shown: String = self.name.text.chars().skip(skip).take(room).collect();
+        let mark = if self.problem().is_none() { Span::styled(" ✓", OK) } else { Span::raw("") };
+        let lines = vec![
+            Line::from(vec![Span::styled(format!("{:LABEL$}", "Name"), ACCENT), Span::raw(shown), mark]),
+            Line::default(),
+            match self.problem() {
+                Some(problem) => Line::styled(problem, ERROR),
+                None => {
+                    Line::styled(format!("a new VM with a copy of {}'s disk, and a name of its own", self.source), DIM)
+                }
+            },
+            Line::styled("enter clone · esc cancel", DIM),
+        ];
+        frame.render_widget(Paragraph::new(lines), area);
+        let cursor = Position::new(area.x + (LABEL + self.name.cursor - skip) as u16, area.y);
+        if area.contains(cursor) {
+            frame.set_cursor_position(cursor);
+        }
+    }
+}
+
 fn other(arch: Arch) -> Arch {
     match arch {
         Arch::Aarch64 => Arch::X86_64,
