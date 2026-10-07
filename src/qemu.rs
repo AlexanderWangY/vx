@@ -15,7 +15,7 @@ use crate::backend::{Backend, Check, CommandLine, Console, Forwards, Pause, Snap
 use crate::host::{self, Arch, Os};
 use crate::style::{self, ERR};
 use crate::vx::Vm;
-use crate::{hinted, qmp};
+use crate::{hinted, mount, qmp};
 use probe::Host;
 
 /// How long a guest gets to react to the power button before it's forced off.
@@ -153,6 +153,10 @@ impl Qemu {
             // Marks this QEMU as one that can save memory; see `saves_memory`.
             if let Ok(pid) = read_pid(vm) {
                 let _ = fs::write(vm.path(LIVE), pid.to_string());
+            }
+            // Mounts the VM's shared folders once it's up, however it was started.
+            if let Err(e) = mount::ensure_agent(vm) {
+                style::warn("", format!("{}'s folders won't be mounted: {e:#}", vm.name));
             }
             return Ok(());
         }
@@ -519,6 +523,7 @@ mod tests {
                 cpus: 4,
                 memory: "4G".into(),
                 forward: vec![],
+                mounts: vec![],
                 ssh: SshSpec { user: "me".into(), port: 2222 },
                 qemu: None,
             },

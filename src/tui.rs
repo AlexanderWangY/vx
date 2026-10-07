@@ -684,6 +684,7 @@ impl App {
             install: vec![],
             setup: None,
             bare: false,
+            mount: vec![],
         };
         match NewForm::new(&self.home, args) {
             Ok(form) => self.modal = Some(Modal::New(Box::new(form))),
@@ -1382,6 +1383,10 @@ impl App {
                 ports => format!("{} · f to change", ports.join(", ")),
             };
             lines.push(field("ports", ports));
+            if !spec.mounts.is_empty() {
+                let mounts: Vec<&str> = spec.mounts.iter().map(|m| m.guest.as_str()).collect();
+                lines.push(field("mount", mounts.join(", ")));
+            }
             if let Some(disk) = entry.disk {
                 lines.push(field("file", format!("{} on host", bytes(disk))));
             }
@@ -1793,6 +1798,9 @@ fn new_argv(args: &NewArgs) -> Vec<String> {
     if let Some(setup) = &args.setup {
         argv.extend(["--setup".into(), setup.clone()]);
     }
+    for m in &args.mount {
+        argv.extend(["--mount".into(), m.clone()]);
+    }
     argv
 }
 
@@ -2164,6 +2172,7 @@ mod tests {
             cpus: 4,
             memory: "4G".into(),
             forward: vec![],
+            mounts: vec![],
             ssh: SshSpec { user: "me".into(), port },
             qemu: None,
         };
@@ -2705,6 +2714,17 @@ mod tests {
         assert!(text.contains("SNAPSHOTS") && text.contains("○  k8s ") && text.contains("○  nix-2 "), "{text}");
         assert!(!text.contains(" deps "), "only the newest three:\n{text}");
         assert!(text.contains("S all (2 more) · ctrl-s save one"), "{text}");
+    }
+
+    #[test]
+    fn details_show_mounts() {
+        let mut app = with_vms();
+        assert!(!screen(&mut app, 130, 20).contains("mount "), "nothing mounted, so no line for it");
+        if let Some(Entry { vm: Ok((spec, _)), .. }) = app.vms.as_mut().and_then(|v| v.first_mut()) {
+            spec.mounts =
+                vec![crate::vx::Mount { host: "/Users/me/code".into(), guest: "~/code".into(), read_only: false }];
+        }
+        assert!(screen(&mut app, 130, 20).contains("mount ~/code"));
     }
 
     #[test]

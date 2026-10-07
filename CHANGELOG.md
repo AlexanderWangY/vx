@@ -4,6 +4,9 @@ The Release workflow uses the section matching each version as its GitHub Releas
 
 ## Unreleased
 
+- **Shared folders.** `vx mount dev ~/code` makes `~/code` here show up at `~/code` in `dev`, live both ways, or `vx mount dev .:/srv/app` puts it somewhere else. `--ro` shares it read-only, `vx mount dev` lists them, `vx mount rm dev ~/code` stops sharing one, and `vx new --mount` shares one from the start. A running VM gets it straight away, and it's saved in `vx.toml` for next time. It works on every built-in distro: sshfs over vx's SSH connection, installed in the VM the first time.
+- `sshfs` is one of the package names `vx install` translates for each distro.
+
 ## 0.3.0
 
 - **New VMs come set up the way you like.** List packages in `~/.vx/config.toml` (`[new] install = ["git", "build-tools"]`) and every `vx new` installs them once the VM is up, then runs your own setup script if you give one (`setup = "~/.vx/setup.sh"`, run as you). `build-tools`, `python`, `node`, `go`, `rust` and `fd` work on every distro; other names are the distro's own. `vx new --install`, `--setup` and `--bare` change it for one VM, the dashboard's new-VM form shows it, and `vx install <vm> <packages>` installs into an existing VM.

@@ -213,6 +213,8 @@ pub struct NewForm {
     setup: Input,
     /// Whether the two above came from config.toml, for the tips.
     has_defaults: bool,
+    /// `--mount` flags, passed through as they are.
+    mount: Vec<String>,
 }
 
 /// Rows besides the image list: name, blank, blank, sizes, blank, install, setup, blank,
@@ -286,6 +288,7 @@ impl NewForm {
             install: Input::new(&plan.install.join(", ")),
             setup: Input::new(plan.setup.as_deref().unwrap_or_default()),
             has_defaults,
+            mount: args.mount,
             defaults,
         })
     }
@@ -447,6 +450,7 @@ impl NewForm {
             install: self.packages(),
             setup: Some(self.setup.text.trim().to_string()).filter(|s| !s.is_empty()),
             bare: true,
+            mount: self.mount.clone(),
         })
     }
 
@@ -1013,6 +1017,9 @@ pub fn command_line(home: &Home, args: &NewArgs) -> Result<String> {
     if args.no_start {
         line += " --no-start";
     }
+    for m in &args.mount {
+        line += &format!(" --mount {m}");
+    }
     // Only what differs from the defaults in config.toml.
     let usual = setup::Plan::new(&config.new, false, &[], None);
     let plan = setup::Plan::new(&config.new, args.bare, &args.install, args.setup.as_deref());
@@ -1161,6 +1168,7 @@ mod tests {
             install: vec![],
             setup: None,
             bare: false,
+            mount: vec![],
         }
     }
 

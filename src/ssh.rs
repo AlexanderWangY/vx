@@ -96,6 +96,11 @@ pub fn write_config(home: &Home, vm: &Vm, addr: SocketAddr) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// `ssh` into the VM, through its ssh_config.
+pub fn command(config: &Path, vm: &Vm) -> Command {
+    ssh(config, vm)
+}
+
 fn ssh(config: &Path, vm: &Vm) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg("-F").arg(config).arg(alias(&vm.name));
